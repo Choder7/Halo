@@ -68,7 +68,7 @@ No pip. No dnf. No Flatpak.
 
 ## Install
 
-1. Download **[halo.py](../../raw/main/halo.py)**.
+1. Download **[halo.py](https://github.com/Choder7/Halo/raw/main/halo.py)**.
 2. Right-click it in Files, then *Properties ▸ Permissions*, and tick **Allow executing file as program**.
 3. Double-click it. In the popup, click **⋯ ▸ Set up Halo**.
 
