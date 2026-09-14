@@ -1,2 +1,129 @@
+<div align="center">
+
 # Halo
-Google Search Popup for Fedora Workstation 44
+
+**Google, one keypress away.**
+
+A floating search popup for Fedora Workstation. One file, no installer, no dependencies.
+
+<p>
+<img alt="License GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-4c8bf5?style=flat-square">
+<img alt="Fedora Workstation 44" src="https://img.shields.io/badge/Fedora%20Workstation-44-51a2da?style=flat-square">
+<img alt="GTK4 and libadwaita" src="https://img.shields.io/badge/GTK4-libadwaita-2ec27e?style=flat-square">
+<img alt="One file" src="https://img.shields.io/badge/install-one%20file-f6d32d?style=flat-square">
+</p>
+
+<sub><i>✦ This passion project is heavily AI-generated.</i></sub>
+
+</div>
+
+<br>
+
+This is the main Halo window you are going to see:
+
+<div align="center">
+<img src="assets/halo-window.png" alt="The Halo pill, empty, with its rim sweeping through Google's colours, then a query being typed and suggestions dropping down" width="760">
+</div>
+
+<br>
+
+Press Enter and it unfolds into Google, in Google's own dark theme:
+
+<div align="center">
+<img src="assets/halo-search.png" alt="Halo expanding from the pill into a full panel of dark-mode Google results" width="760">
+</div>
+
+<br>
+
+Both clips above are Halo's real pixels, rendered straight out of the running app.
+
+<br>
+
+## What it does
+
+- Floats above every window. No full screen, no tab, no new browser.
+- Results open **inside** it. Click a link and you are reading the page, still in Halo.
+- Google's genuine dark theme. No injected stylesheets, no inverted colours.
+- Never asks about cookies. It answers the consent banner once, invisibly, on your behalf.
+- Leaves your clipboard alone.
+- Goes away on Esc.
+
+<br>
+
+## Requirements
+
+Halo is a GTK4 app, designed and tested specifically on **Fedora Workstation 44** (GNOME 50, Wayland). It might or might not work on other distributions. Nothing stops you trying, and nothing breaks if it does not.
+
+Everything it needs is already on a stock Fedora Workstation:
+
+| | |
+| --- | --- |
+| GTK 4, libadwaita, WebKitGTK 6 | ship with GNOME Shell |
+| PyGObject | arrives with `gnome-browser-connector` |
+| Python 3 | already there |
+
+No pip. No dnf. No Flatpak.
+
+<br>
+
+## Install
+
+1. Download **[halo.py](../../raw/main/halo.py)**.
+2. Right-click it in Files, then *Properties ▸ Permissions*, and tick **Allow executing file as program**.
+3. Double-click it. In the popup, click **⋯ ▸ Set up Halo**.
+
+That last step adds Halo to your app grid, starts it at login, and binds **Super + G**. It shows you every file it wants to create and waits for your yes.
+
+Moving `halo.py` somewhere else later is fine. Halo notices, re-points its own launcher and shortcut, and tells you it did.
+
+To update, drop the newer `halo.py` over the old one. The running copy stands down and the next keypress starts the new one.
+
+<br>
+
+## Keys
+
+Enough to get going. The full list lives inside the app, under **⋯ ▸ Manual & shortcuts**, so a lone `halo.py` is still documented.
+
+| | |
+| --- | --- |
+| **Super + G** | Open Halo (any number of other keys can be bound too) |
+| **Enter** | Search |
+| **Esc** | Hide |
+| **↑** on an empty field | What you searched before |
+| **Ctrl + Shift + S** | Grab a region of the screen and search it with Lens |
+| **Ctrl + Enter** | Send the current page to your real browser |
+
+You can also drop an image onto the pill to reverse-search it, or middle-click it to search whatever text is selected anywhere on screen.
+
+<br>
+
+## Where it lives
+
+Plain files in your home folder. No system directory, no package, no root.
+
+| | |
+| --- | --- |
+| Launcher | `~/.local/share/applications/` |
+| Start at login | `~/.config/autostart/` |
+| Settings | `~/.config/halo/config.json` |
+| History, cookies, cache | `~/.local/share/halo/` |
+| Shortcuts | ordinary GNOME custom shortcuts |
+
+**⋯ ▸ Remove Halo's setup** deletes all of it and asks whether to keep your data. Delete `halo.py` afterwards and nothing is left.
+
+<br>
+
+## Privacy
+
+- No telemetry. No account. No analytics. Nothing phones home.
+- Cookies live in Halo's own jar, readable only by you. They are not your browser's.
+- Search history is a local file. Forget one entry, or all of them, from the menu.
+- Halo does not spoof its user agent. Pretending to be Chrome is what gets you a CAPTCHA.
+
+You are talking to Google, so Google knows what you searched. Nobody else is in the way.
+
+<br>
+
+## License
+
+[GPL-3.0](LICENSE). Use it, change it, share it. If you distribute a changed version, publish your source too.

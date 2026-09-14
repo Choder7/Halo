@@ -1,0 +1,18 @@
+# Working copies kept beside halo.py, never published.
+*.bak
+*.pre-*
+
+# The test and diagnostic harnesses are written against one machine.
+halo-selftest.py
+halo-setuptest.py
+halo-diagnose.py
+halo-watch.py
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Halo's own runtime state, if anyone ever runs it from a checkout.
+config.json
+history.json
+cookies.sqlite*
