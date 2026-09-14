@@ -4,7 +4,7 @@
 
 **Google, one keypress away.**
 
-A floating search popup for Fedora Workstation. One file, no installer, no dependencies.
+A floating search popup for Fedora Workstation.
 
 <p>
 <img alt="License GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-4c8bf5?style=flat-square">
@@ -27,7 +27,7 @@ This is the main Halo window you are going to see:
 
 <br>
 
-Press Enter and it unfolds into Google, in Google's own dark theme:
+Press Enter and it unfolds into Google:
 
 <div align="center">
 <img src="assets/halo-search.png" alt="Halo expanding from the pill into a full panel of dark-mode Google results" width="760">
@@ -35,71 +35,62 @@ Press Enter and it unfolds into Google, in Google's own dark theme:
 
 <br>
 
-Both clips above are Halo's real pixels, rendered straight out of the running app.
-
 <br>
 
 ## What it does
 
-- Floats above every window. No full screen, no tab, no new browser.
-- Results open **inside** it. Click a link and you are reading the page, still in Halo.
-- Google's genuine dark theme. No injected stylesheets, no inverted colours.
-- Never asks about cookies. It answers the consent banner once, invisibly, on your behalf.
-- Leaves your clipboard alone.
-- Goes away on Esc.
+- Floats above every window when activated.
+- Results open **inside** it, no need to launch your browser for a quick question.
+- Nice theme.
+- Tells Google to deny.
+- Goes away on Esc or keybind.
 
 <br>
 
 ## Requirements
 
-Halo is a GTK4 app, designed and tested specifically on **Fedora Workstation 44** (GNOME 50, Wayland). It might or might not work on other distributions. Nothing stops you trying, and nothing breaks if it does not.
+Halo is a GTK4 app, designed and tested specifically on **Fedora Workstation 44** (GNOME 50, Wayland). It might or might not work on other distributions. Nothing stops you trying, and nothing should break if it doesn't work.
 
-Everything it needs is already on a stock Fedora Workstation:
-
-| | |
-| --- | --- |
-| GTK 4, libadwaita, WebKitGTK 6 | ship with GNOME Shell |
-| PyGObject | arrives with `gnome-browser-connector` |
-| Python 3 | already there |
-
-No pip. No dnf. No Flatpak.
+Everything it needs is already preinstalled on stock Fedora Workstation:
+- GTK 4, libadwaita, WebkitGTK 6
+- PyGObject, Python 3
 
 <br>
 
-## Install
+## Installation
 
 1. Download **[halo.py](https://github.com/Choder7/Halo/raw/main/halo.py)**.
-2. Right-click it in Files, then *Properties ▸ Permissions*, and tick **Allow executing file as program**.
-3. Double-click it. In the popup, click **⋯ ▸ Set up Halo**.
+2. Move it to a location you plan on leaving it. (You can always move it to another location later, just repeat step 4 once and it will automatically repoint everything to the new location)
+3. Right-click it in Files, then choose *Properties*, and tick **Allow executing file as program**.
+4. Right-click it again, and choose **Execute as Program**.
+5. In the popup, click **⋮** and then **Set up Halo**.
 
-That last step adds Halo to your app grid, starts it at login, and binds **Super + G**. It shows you every file it wants to create and waits for your yes.
+After that Halo is automatically added to your app grid, starts it at login, and binds your custom keybind(s). It shows you every file it wants to create and waits for your yes. (You can configure it what it should create before proceeding)
 
-Moving `halo.py` somewhere else later is fine. Halo notices, re-points its own launcher and shortcut, and tells you it did.
 
-To update, drop the newer `halo.py` over the old one. The running copy stands down and the next keypress starts the new one.
+To update to a newer version, simply drop the newer "halo.py" over the old one. (Or delete the old one and put in the new one.) No data will be lost.
 
 <br>
 
-## Keys
+## Keybinds
 
-Enough to get going. The full list lives inside the app, under **⋯ ▸ Manual & shortcuts**, so a lone `halo.py` is still documented.
+The full list can be opened within Halo, under **⋮** → **Manual & shortcuts**.
 
+Essentials:
 | | |
 | --- | --- |
-| **Super + G** | Open Halo (any number of other keys can be bound too) |
+| **Custom Keybind(s)** | Open Halo |
 | **Enter** | Search |
-| **Esc** | Hide |
-| **↑** on an empty field | What you searched before |
+| **Ctrl + Enter** | Open current page or search in default browser |
+| **Esc/Custom Keybind(s)** | Hide |
+| **Arrow up ↑** | Search history |
 | **Ctrl + Shift + S** | Grab a region of the screen and search it with Lens |
-| **Ctrl + Enter** | Send the current page to your real browser |
 
-You can also drop an image onto the pill to reverse-search it, or middle-click it to search whatever text is selected anywhere on screen.
+You can also drop an image onto the Halo pill to Google-search it, or middle-click it to search whatever text is selected anywhere on screen.
 
 <br>
 
 ## Where it lives
-
-Plain files in your home folder. No system directory, no package, no root.
 
 | | |
 | --- | --- |
@@ -109,21 +100,10 @@ Plain files in your home folder. No system directory, no package, no root.
 | History, cookies, cache | `~/.local/share/halo/` |
 | Shortcuts | ordinary GNOME custom shortcuts |
 
-**⋯ ▸ Remove Halo's setup** deletes all of it and asks whether to keep your data. Delete `halo.py` afterwards and nothing is left.
-
-<br>
-
-## Privacy
-
-- No telemetry. No account. No analytics. Nothing phones home.
-- Cookies live in Halo's own jar, readable only by you. They are not your browser's.
-- Search history is a local file. Forget one entry, or all of them, from the menu.
-- Halo does not spoof its user agent. Pretending to be Chrome is what gets you a CAPTCHA.
-
-You are talking to Google, so Google knows what you searched. Nobody else is in the way.
+**⋯ ▸ Remove Halo's setup** deletes all of it and asks whether to keep your data. Then delete "halo.py".
 
 <br>
 
 ## License
 
-[GPL-3.0](LICENSE). Use it, change it, share it. If you distribute a changed version, publish your source too.
+[GPL-3.0](LICENSE).
