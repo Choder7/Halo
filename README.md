@@ -6,6 +6,14 @@
 
 A floating search popup for Fedora Workstation.
 
+<br>
+
+<a href="https://github.com/Choder7/Halo/releases/latest">
+<img alt="Download Halo" src="https://img.shields.io/badge/Download-halo.py-4c8bf5?style=for-the-badge&logo=github&logoColor=white&labelColor=1f1f1f">
+</a>
+
+<br>
+
 <p>
 <img alt="License GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-4c8bf5?style=flat-square">
 <img alt="Fedora Workstation 44" src="https://img.shields.io/badge/Fedora%20Workstation-44-51a2da?style=flat-square">
@@ -59,7 +67,7 @@ Everything it needs is already preinstalled on stock Fedora Workstation:
 
 ## Installation
 
-1. Download **[halo.py](https://github.com/Choder7/Halo/raw/main/halo.py)**.
+1. Download **[halo.py](https://github.com/Choder7/Halo/releases/latest/download/halo.py)**.
 2. Move it to a location you plan on leaving it. (You can always move it to another location later, just repeat step 4 once and it will automatically repoint everything to the new location)
 3. Right-click the "Halo.py" file, then choose *Properties*, and tick **Allow executing file as program**.
 4. Right-click it again, and choose **Execute as Program**.
@@ -107,8 +115,8 @@ You can also drop an image onto the Halo pill to Google-search it, or middle-cli
 
 ## Story
 
-I've got a so-called "Copilot Key" on my laptop's keyboard, which I was trying to find a viable use for for a long time. After the Google app for Windows came to mind, I found out that it does not support Linux whatsoever, which made me look for other options out there, but I couldn't find anything that would satisfy my needs. So I started building my own, mainly using AI. I've already been using Halo for a few months now, and now wanted to share it publicly for other people searching for the same as me.
-Please leave some feedback for me to improve Halo upon.
+I've got a so-called "**Copilot Key**" on my laptop's keyboard, which I was trying to find a **viable use** for for a long time. After the **Google app for Windows** came to mind, I found out that it does not support Linux whatsoever, which made me look for other options out there, but I couldn't find **anything** that would satisfy my needs. So I just started **building my own**, mainly using AI. I've already been using Halo for a few months now, and simply wanted to share it publicly for other people searching for the same as me. \
+Please leave me some feedback for me to improve Halo upon, thanks!
 
 <br>
 
