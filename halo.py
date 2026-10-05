@@ -78,7 +78,7 @@ from pathlib import Path
 
 APP_ID = "io.github.choder7.Halo"
 APP_NAME = "Halo"
-VERSION = "1.35.1"
+VERSION = "1.36.0"
 
 AUTHOR = "Choder7"
 PROJECT_URL = "https://github.com/Choder7/Halo"
@@ -139,6 +139,7 @@ DEFAULTS = {
                                  # hidden; 0 keeps it resident for ever
     "history": True,             # keep a list of what has been searched
     "history_in_suggestions": True,   # surface close past searches while typing
+    "quick_answers": True,       # sums and conversions as the first suggestion
     "history_days": 60,          # forget entries older than this; 0 keeps them
     # The picture the pill is carrying, as {"path", "name", "uri", "origin"} —
     # or None. State rather than a setting, and kept here for the same reason
@@ -1053,7 +1054,7 @@ class Config:
         number("reveal_ms", 0, 1000, int)
         for key in ("suggestions", "remember_position", "safe_search",
                     "compact_results", "warmed_up", "history",
-                    "history_in_suggestions", "parked_arrow"):
+                    "history_in_suggestions", "parked_arrow", "quick_answers"):
             self.data[key] = bool(self.data.get(key, DEFAULTS[key]))
 
         # A remembered attachment names a file, and a file can be deleted
@@ -1919,6 +1920,15 @@ button.halo-thumb:hover .halo-thumb-x {
 }
 .halo-suggest > row:selected image { color: rgba(138,180,248,0.95); }
 .halo-suggest-hint { color: rgba(255,255,255,0.32); font-size: 11px; }
+/* The quick answer: the number is the point, so it is the one row in full white. */
+.halo-answer { color: #ffffff; font-weight: 600; }
+.halo-suggest > row image.halo-copied,
+.halo-suggest > row:selected image.halo-copied { color: #57c98a; }
+/* "Copy" appears where the answer row is about to be used, "Copied" after. */
+.halo-answer-hint { opacity: 0; transition: opacity 120ms ease; }
+.halo-suggest > row:hover .halo-answer-hint,
+.halo-suggest > row:selected .halo-answer-hint { opacity: 1; }
+.halo-answer-hint.halo-copied { opacity: 1; color: #57c98a; }
 
 /* The Google mark doubles as the history button, so it needs a hover state and a
    held-open one — but deliberately the SAME 30px circle as .halo-chip, because
@@ -3576,6 +3586,613 @@ def looks_like_url(text: str) -> str | None:
         return "https://" + t
     return None
 
+# ── a quick answer for sums and conversions ─────────────────────────────────
+#
+# Typing "12*7" or "5 km in miles" gets the answer as the first row of the
+# suggestions, before Google has been asked anything. Enter still searches;
+# the row is there to be read, Tab puts the number in the field, and picking
+# the row copies it. Worked out here, on the machine, so nothing extra leaves
+# it — and nothing that needs a service (currencies) is attempted at all.
+#
+# A hand-written parser rather than eval(): the field is untrusted text, and
+# Python's own grammar is both too much (attribute access, calls) and not what
+# people type (×, ÷, ^, 2π, 15% of 80, 5!).
+CALC_MAX_DIGITS = 21            # longer integers are shown in scientific form
+# The second field of a suggestion row: True for a past search, False for one of
+# Google's, and this for the quick answer.
+ANSWER_ROW = "answer"
+
+
+class _CalcError(Exception):
+    pass
+
+
+class _Pct(float):
+    """A bare "10%": a fraction on its own, but "200 + 10%" is 220, the way a
+    pocket calculator and a phone read it."""
+
+
+def _trig(fn):
+    """sin(π) is 0, not 1.2 × 10⁻¹⁶ — and tan at a pole has no value at all."""
+    def wrapped(x):
+        result = fn(x)
+        if abs(result) < 1e-12 and abs(x) > 1e-6:
+            return 0.0
+        if abs(result) > 1e12:
+            raise ValueError("pole")
+        return result
+    return wrapped
+
+
+_CALC_FUNCS = {
+    "sqrt": math.sqrt, "√": math.sqrt, "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x),
+    "sin": _trig(math.sin), "cos": _trig(math.cos), "tan": _trig(math.tan),
+    "asin": math.asin, "acos": math.acos, "atan": math.atan,
+    "arcsin": math.asin, "arccos": math.acos, "arctan": math.atan,
+    "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+    "ln": math.log, "log": math.log10, "lg": math.log10, "log2": math.log2,
+    "exp": math.exp, "abs": abs, "floor": math.floor, "ceil": math.ceil,
+    "round": round,
+}
+_CALC_CONSTS = {"pi": math.pi, "π": math.pi, "e": math.e, "tau": math.tau, "τ": math.tau}
+
+_CALC_TOKEN = re.compile(r"""
+    \s*(?:
+      (?P<num>(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?)
+    | (?P<word>log2|[A-Za-zπτ]+|√)
+    | (?P<op>\*\*|[-+*/×÷·^%!()°−])
+    )""", re.VERBOSE)
+
+# What a whole query has to look like before it is worth parsing: digits,
+# operators, brackets, spaces and a short list of words. Cheap, and it keeps
+# the parser away from ordinary searches entirely.
+_CALC_WORDS = set(_CALC_FUNCS) | set(_CALC_CONSTS) | {"of", "von", "mod", "deg", "x"}
+# Dates, times, phone numbers and version strings are searches, not sums.
+_NOT_A_SUM = re.compile(r"""^(
+      \d{4}-\d{1,2}-\d{1,2}              # 2026-10-04
+    | \d{1,2}[./]\d{1,2}[./]\d{2,4}      # 04.10.2026, 10/4/26
+    | [\d\s]*\d+(-\d+){2,}[\d\s]*        # 1-800-555-0100
+    | \+?\d[\d\s]{6,}                    # +49 151 1234567
+    )$""", re.VERBOSE)
+
+
+def _decimal_comma() -> bool:
+    """Whether this desktop writes 7,5 rather than 7.5 (from the locale)."""
+    for var in ("LC_ALL", "LC_NUMERIC", "LANG"):
+        value = os.environ.get(var, "")
+        if value:
+            lang = value.split(".")[0].split("_")[0].lower()
+            return lang in {"de", "fr", "es", "it", "nl", "pt", "pl", "cs", "sv",
+                            "da", "fi", "nb", "nn", "no", "ru", "tr", "uk", "hu",
+                            "ro", "sk", "sl", "hr", "sr", "bg", "el", "et", "lv",
+                            "lt", "id", "vi"}
+    return False
+
+
+class _CalcParser:
+    """expr := term (('+'|'-') term)*
+       term := unary (('*'|'/'|mod) unary | implicit unary)*
+       unary := ('-'|'+') unary | power
+       power := postfix ('^' unary)?
+       postfix := primary ('!' | '%' | '°')* ['of' unary]
+    """
+
+    def __init__(self, tokens: list[tuple[str, str]], comma: bool):
+        self.toks = tokens
+        self.i = 0
+        self.comma = comma
+        self.used_op = False         # a bare number is not a sum
+
+    def peek(self, kind=None, value=None):
+        if self.i >= len(self.toks):
+            return None
+        tok = self.toks[self.i]
+        if kind and tok[0] != kind:
+            return None
+        if value is not None and tok[1] not in (value if isinstance(value, tuple) else (value,)):
+            return None
+        return tok
+
+    def take(self):
+        tok = self.toks[self.i]
+        self.i += 1
+        return tok
+
+    def parse(self):
+        value = self.expr()
+        if self.i != len(self.toks):
+            raise _CalcError("trailing input")
+        return value
+
+    def expr(self):
+        value = self.term()
+        while self.peek("op", ("+", "-", "−")):
+            op = self.take()[1]
+            self.used_op = True
+            rhs = self.term()
+            if isinstance(rhs, _Pct):
+                rhs = value * rhs
+            result = value + rhs if op == "+" else value - rhs
+            # 0.1 + 0.2 - 0.3 is 0, not 5.55 × 10⁻¹⁷: a difference far below the
+            # precision of what went into it is rounding, not an answer.
+            if isinstance(result, float) and result and \
+                    abs(result) <= 1e-12 * max(abs(value), abs(rhs)):
+                result = 0.0
+            value = result
+        return value
+
+    def term(self):
+        value = self.unary()
+        while True:
+            if self.peek("op", ("*", "×", "·", "/", "÷")) or self.peek("word", "mod") \
+                    or (self.peek("op", "%") and self._percent_is_modulo()):
+                op = self.take()[1]
+                self.used_op = True
+                rhs = self.unary()
+                if op in ("*", "×", "·"):
+                    value = value * rhs
+                elif op in ("/", "÷"):
+                    if rhs == 0:
+                        raise _CalcError("division by zero")
+                    value = _div(value, rhs)
+                else:
+                    if rhs == 0:
+                        raise _CalcError("modulo by zero")
+                    value = value % rhs
+            elif self.peek("op", "(") or self.peek("num") is None and self._starts_primary():
+                # 2(3+4), 2π, 3 sqrt 16 — but never two numbers side by side,
+                # which is a phone number or a typo rather than a product.
+                self.used_op = True
+                value = value * self.unary()
+            else:
+                return value
+
+    def _starts_primary(self) -> bool:
+        tok = self.peek("word")
+        # Not e: "2e" is half of "2e5" far more often than it is 2 × e.
+        return bool(tok) and tok[1].lower() != "e" and (
+            tok[1].lower() in _CALC_FUNCS or tok[1].lower() in _CALC_CONSTS)
+
+    def _percent_is_modulo(self) -> bool:
+        nxt = self.toks[self.i + 1] if self.i + 1 < len(self.toks) else None
+        return bool(nxt) and (nxt[0] == "num" or nxt[1] == "(")
+
+    def unary(self):
+        if self.peek("op", ("-", "−")):
+            self.take()
+            return -self.unary()
+        if self.peek("op", "+"):
+            self.take()
+            return self.unary()
+        return self.power()
+
+    def power(self):
+        base = self.postfix()
+        if self.peek("op", ("^", "**")):
+            self.take()
+            self.used_op = True
+            exp = self.unary()
+            return _pow(base, exp)
+        return base
+
+    def postfix(self):
+        value = self.primary()
+        while True:
+            if self.peek("op", "!"):
+                self.take()
+                self.used_op = True
+                if not (isinstance(value, int) or float(value).is_integer()) \
+                        or not 0 <= value <= 170:
+                    raise _CalcError("factorial")
+                value = math.factorial(int(value))
+            elif self.peek("op", "%") and not self._percent_is_modulo():
+                self.take()
+                self.used_op = True
+                value = _Pct(value / 100)
+                if self.peek("word", ("of", "von")):
+                    self.take()
+                    value = float(value) * self.unary()
+            elif self.peek("op", "°") or self.peek("word", "deg"):
+                self.take()
+                value = math.radians(value)
+            else:
+                return value
+
+    def primary(self):
+        tok = self.peek()
+        if tok is None:
+            raise _CalcError("unexpected end")
+        kind, text = self.take()
+        if kind == "num":
+            return _number(text, self.comma)
+        if kind == "op" and text == "(":
+            value = self.expr()
+            if not self.peek("op", ")"):
+                raise _CalcError("unclosed bracket")
+            self.take()
+            return value
+        if kind == "op" and text == "√":
+            self.used_op = True
+            return _apply(math.sqrt, self.postfix())
+        if kind == "word":
+            name = text.lower() if text not in ("π", "τ", "√") else text
+            if name in _CALC_CONSTS:
+                self.used_op = self.used_op or name not in ("e",)
+                return _CALC_CONSTS[name]
+            if name in _CALC_FUNCS:
+                self.used_op = True
+                return _apply(_CALC_FUNCS[name], self.postfix())
+        raise _CalcError(f"unexpected {text!r}")
+
+
+def _number(text: str, comma: bool):
+    if comma and re.fullmatch(r"\d{1,3}\.\d{3}", text):
+        # On a desktop that writes 7,5, "1.000" is a thousand as often as it is
+        # one — measured nowhere, but a wrong answer is worse than none, so a
+        # number that could be either gets no answer at all.
+        raise _CalcError("ambiguous")
+    if "," in text:
+        if not comma:
+            raise _CalcError("comma")
+        text = text.replace(",", ".")
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return float(text)
+
+
+def _div(a, b):
+    if isinstance(a, int) and isinstance(b, int) and a % b == 0:
+        return a // b
+    return a / b
+
+
+def _pow(base, exp):
+    if isinstance(base, int) and isinstance(exp, int) and 0 <= exp <= 4096 \
+            and abs(base) < 10 ** 6:
+        return base ** exp
+    try:
+        result = math.pow(base, exp)
+    except (OverflowError, ValueError):
+        raise _CalcError("power")
+    return result
+
+
+def _apply(fn, value):
+    try:
+        return fn(value)
+    except (ValueError, OverflowError, TypeError):
+        raise _CalcError("domain")
+
+
+def _calc_tokens(text: str) -> list[tuple[str, str]]:
+    tokens, pos = [], 0
+    text = text.rstrip()
+    while pos < len(text):
+        m = _CALC_TOKEN.match(text, pos)
+        if not m or m.end() == pos:
+            raise _CalcError("token")
+        pos = m.end()
+        kind = m.lastgroup
+        value = m.group(kind)
+        if kind == "word" and value.lower() not in _CALC_WORDS \
+                and value not in ("π", "τ", "√"):
+            raise _CalcError("word")
+        if kind == "op" and value == "−":
+            value = "-"
+        if kind == "word" and value.lower() == "x":
+            kind, value = "op", "×"          # 3x4, the way people type it
+        tokens.append((kind, value))
+    return tokens
+
+
+def calculate(text: str):
+    """The value of a sum, or None when the text is not one."""
+    text = text.strip().rstrip("=").strip()
+    # A digit or a bracket: "pi", "e" and "tau" on their own are searches.
+    if not text or len(text) > 120 or not re.search(r"[\d(]", text) \
+            or _NOT_A_SUM.match(text):
+        return None
+    comma = _decimal_comma()
+    try:
+        tokens = _calc_tokens(text)
+        parser = _CalcParser(tokens, comma)
+        value = parser.parse()
+    except (_CalcError, RecursionError, OverflowError, ZeroDivisionError):
+        return None
+    if not parser.used_op:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, complex):
+        return None
+    if isinstance(value, int) and abs(value) >= 10 ** 300:
+        return None
+    return float(value) if isinstance(value, _Pct) else value
+
+
+def format_number(value, comma: bool | None = None) -> str:
+    """12 significant digits, no trailing zeros, the desktop's decimal mark."""
+    if comma is None:
+        comma = _decimal_comma()
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e15:
+        value = int(value)
+    if isinstance(value, int):
+        text = str(value)
+        if len(text.lstrip("-")) > CALC_MAX_DIGITS:
+            value = float(value)
+        else:
+            return text
+    if value == 0:
+        return "0"
+    text = format(value, ".12g")
+    if "e" in text:
+        mant, exp = text.split("e")
+        text = f"{mant} × 10^{int(exp)}"
+    if comma:
+        text = text.replace(".", ",")
+    return text
+
+
+# ── conversions ──
+# Each unit is a factor to the base of its kind; temperature is the exception
+# and is converted through kelvin.
+_UNITS: dict[str, tuple[str, float]] = {}
+
+
+def _units(kind: str, factor: float, *names: str) -> None:
+    for name in names:
+        _UNITS[name] = (kind, factor)
+
+
+_units("length", 1e-3, "mm", "millimeter", "millimeters", "millimetre", "millimetres")
+_units("length", 1e-2, "cm", "centimeter", "centimeters", "centimetre", "centimetres", "zentimeter")
+_units("length", 1.0, "m", "meter", "meters", "metre", "metres")
+_units("length", 1e3, "km", "kilometer", "kilometers", "kilometre", "kilometres")
+_units("length", 0.0254, "in", "inch", "inches", "zoll", '"')
+_units("length", 0.3048, "ft", "foot", "feet", "fuß", "fuss", "'")
+_units("length", 0.9144, "yd", "yard", "yards")
+_units("length", 1609.344, "mi", "mile", "miles", "meile", "meilen")
+_units("length", 1852.0, "nmi", "seemeile", "seemeilen")
+_units("mass", 1e-6, "mg", "milligram", "milligrams", "milligramm")
+_units("mass", 1e-3, "g", "gram", "grams", "gramm")
+_units("mass", 1.0, "kg", "kilo", "kilos", "kilogram", "kilograms", "kilogramm")
+_units("mass", 1e3, "t", "tonne", "tonnes", "tonnen")
+_units("mass", 0.45359237, "lb", "lbs", "pound", "pounds")
+_units("mass", 0.028349523125, "oz", "ounce", "ounces", "unze", "unzen")
+_units("mass", 6.35029318, "st", "stone")
+_units("volume", 1e-3, "ml", "milliliter", "milliliters", "millilitre", "millilitres")
+_units("volume", 1e-2, "cl")
+_units("volume", 1e-1, "dl")
+_units("volume", 1.0, "l", "liter", "liters", "litre", "litres")
+_units("volume", 3.785411784, "gal", "gallon", "gallons")
+_units("volume", 0.0295735295625, "floz", "fl oz")
+_units("volume", 0.2365882365, "cup", "cups")
+_units("speed", 1 / 3.6, "km/h", "kmh", "kph")
+_units("speed", 1.0, "m/s")
+_units("speed", 0.44704, "mph")
+_units("speed", 1852 / 3600, "kn", "knot", "knots", "knoten")
+_units("time", 1e-3, "ms")
+_units("time", 1.0, "s", "sec", "secs", "second", "seconds", "sekunde", "sekunden")
+_units("time", 60.0, "min", "mins", "minute", "minutes", "minuten")
+_units("time", 3600.0, "h", "hr", "hrs", "hour", "hours", "stunde", "stunden")
+_units("time", 86400.0, "d", "day", "days", "tag", "tage", "tagen")
+_units("time", 604800.0, "wk", "week", "weeks", "woche", "wochen")
+_units("time", 31557600.0, "yr", "yrs", "year", "years", "jahr", "jahre", "jahren")
+_units("data", 1.0, "b", "byte", "bytes")
+_units("data", 1e3, "kb", "kilobyte", "kilobytes")
+_units("data", 1e6, "mb", "megabyte", "megabytes")
+_units("data", 1e9, "gb", "gigabyte", "gigabytes")
+_units("data", 1e12, "tb", "terabyte", "terabytes")
+_units("data", 1024.0, "kib")
+_units("data", 1024.0 ** 2, "mib")
+_units("data", 1024.0 ** 3, "gib")
+_units("data", 1024.0 ** 4, "tib")
+_units("area", 1e-6, "mm²", "sq mm")
+_units("area", 1e-4, "cm²", "sq cm")
+_units("area", 1.0, "m²", "sqm", "sq m")
+_units("area", 1e6, "km²", "sq km")
+_units("area", 1e4, "ha", "hectare", "hectares", "hektar")
+_units("area", 4046.8564224, "acre", "acres")
+_units("area", 0.09290304, "ft²", "sqft", "sq ft")
+_units("area", 0.00064516, "in²", "sq in")
+_units("area", 0.83612736, "yd²", "sq yd")
+_units("area", 2589988.110336, "mi²", "sq mi")
+_units("volume", 1e-3, "cm³", "ccm")
+_units("volume", 1e3, "m³")
+_units("energy", 1.0, "j", "joule", "joules")
+_units("energy", 1e3, "kj", "kilojoule", "kilojoules")
+_units("energy", 4.184, "cal", "calorie", "calories")
+_units("energy", 4184.0, "kcal", "kilocalorie", "kilocalories")
+_units("energy", 3600.0, "wh")
+_units("energy", 3.6e6, "kwh")
+_units("energy", 1055.05585262, "btu")
+_units("power", 1.0, "w", "watt", "watts")
+_units("power", 1e3, "kw", "kilowatt", "kilowatts")
+_units("power", 745.69987158227, "hp", "horsepower")
+_units("power", 735.49875, "ps")
+_units("pressure", 1.0, "pa", "pascal")
+_units("pressure", 100.0, "hpa")
+_units("pressure", 1e3, "kpa")
+_units("pressure", 1e5, "bar")
+_units("pressure", 100.0, "mbar")
+_units("pressure", 6894.757293168, "psi")
+_units("pressure", 101325.0, "atm")
+_units("pressure", 133.322387415, "mmhg")
+_units("angle", 1.0, "rad", "radian", "radians")
+_units("angle", math.pi / 180, "deg", "degree", "degrees")
+_TEMPS = {"c": "c", "°c": "c", "celsius": "c", "f": "f", "°f": "f", "fahrenheit": "f",
+          "k": "k", "kelvin": "k"}
+# How a temperature is written in the answer, whichever way it was typed.
+_TEMP_SHOWN = {"c": "°C", "f": "°F", "k": "K"}
+
+_CONVERSION = re.compile(
+    r"^(?P<amount>.+?)\s*(?P<src>°?[a-zäöüß/\"'²³ ]+?)\s+(?:in|to|into|as|=|->|→|nach|zu)\s+"
+    r"(?P<dst>°?[a-zäöüß/\"'²³ ]+?)\s*$", re.IGNORECASE)
+# m2, km^2, cm3 -> m², km², cm³, so the unit table needs one spelling of each.
+_UNIT_POWER = re.compile(r"(?<=[a-zA-Z])\^?([23])(?![\d.,])")
+
+
+def _conversion_parts(text: str):
+    """(amount text, source unit, target unit, how each is shown), or None."""
+    text = _UNIT_POWER.sub(lambda m: "²" if m[1] == "2" else "³", text.strip())
+    m = _CONVERSION.match(text)
+    if not m:
+        return None
+    src_typed, dst_typed = m["src"].strip(), m["dst"].strip()
+    src, dst = src_typed.lower(), dst_typed.lower()
+
+    def shown(typed, key):
+        return _TEMP_SHOWN[_TEMPS[key]] if key in _TEMPS else typed
+
+    return m["amount"].strip(), src, dst, shown(src_typed, src), shown(dst_typed, dst)
+
+
+def _to_kelvin(value: float, unit: str) -> float:
+    return {"c": value + 273.15, "f": (value - 32) * 5 / 9 + 273.15, "k": value}[unit]
+
+
+def _from_kelvin(value: float, unit: str) -> float:
+    return {"c": value - 273.15, "f": (value - 273.15) * 9 / 5 + 32, "k": value}[unit]
+
+
+def convert(text: str):
+    """(value, target unit as shown) for "5 km in miles", or None."""
+    parts = _conversion_parts(text)
+    if not parts:
+        return None
+    amount_text, src, dst, _src_shown, dst_shown = parts
+    try:
+        tokens = _calc_tokens(amount_text)
+        amount = _CalcParser(tokens, _decimal_comma()).parse()
+    except (_CalcError, RecursionError, OverflowError, ZeroDivisionError):
+        return None
+    if isinstance(amount, complex):
+        return None
+    if src in _TEMPS and dst in _TEMPS:
+        kelvin = _to_kelvin(float(amount), _TEMPS[src])
+        if kelvin < 0:
+            return None
+        return _from_kelvin(kelvin, _TEMPS[dst]), dst_shown
+    a, b = _UNITS.get(src), _UNITS.get(dst)
+    if not a or not b or a[0] != b[0]:
+        return None
+    return float(amount) * a[1] / b[1], dst_shown
+
+
+def _typed_comma(text: str) -> bool:
+    """Answer in the decimal mark the query was typed in, else the desktop's."""
+    if re.search(r"\d,\d", text):
+        return True
+    if re.search(r"\d\.\d", text):
+        return False
+    return _decimal_comma()
+
+
+def quick_answer(text: str) -> str | None:
+    """What the answer row shows for this query, or None for an ordinary search.
+
+    The value alone — "84", "3,10686 miles" — so Tab can put it in the field
+    and copying it gives something that pastes cleanly.
+    """
+    if not text or len(text) > 120:
+        return None
+    converted = convert(text)
+    if converted is not None:
+        value, unit = converted
+        # Six significant digits: a conversion is a measurement, and twelve
+        # digits of "3.10685596119 miles" is noise.
+        rounded = float(f"{value:.6g}")
+        return f"{format_number(rounded, _typed_comma(text))} {unit}"
+    value = calculate(text)
+    if value is None:
+        return None
+    return format_number(value, _typed_comma(text))
+
+
+# ── how the answer row reads ──
+# The row shows the sum it answers, typeset with what a font already has —
+# ×, ÷, the true minus sign, superscript powers, √, π — so "2^10" reads as
+# "2¹⁰ = 1024". Only the label: Tab and copying still use the plain value.
+_SUPERSCRIPT = str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻")
+_PRETTY_OPS = {"*": "×", "×": "×", "·": "×", "/": "÷", "÷": "÷", "+": "+", "-": "−"}
+
+
+def _pretty_tokens(tokens: list[tuple[str, str]]) -> str:
+    out: list[str] = []
+    prev = None                      # the previous token
+    i, n = 0, len(tokens)
+    while i < n:
+        kind, value = tokens[i]
+        low = value.lower()
+        nxt = tokens[i + 1] if i + 1 < n else None
+        unary = (prev is None
+                 or (prev[0] == "op" and prev[1] not in (")", "!", "%", "°"))
+                 or (prev[0] == "word" and prev[1].lower() in ("of", "von", "mod")))
+        if kind == "op" and value in ("^", "**"):
+            # A power with a plain integer exponent becomes a superscript.
+            j, sign = i + 1, ""
+            if j < n and tokens[j] == ("op", "-"):
+                sign, j = "-", j + 1
+            if j < n and tokens[j][0] == "num" and tokens[j][1].isdigit():
+                out.append((sign + tokens[j][1]).translate(_SUPERSCRIPT))
+                prev, i = tokens[j], j + 1
+                continue
+            out.append("^")
+        elif kind == "op" and value == "%":
+            # Postfix percent, unless a number follows, which makes it modulo.
+            out.append(" mod " if nxt and (nxt[0] == "num" or nxt[1] == "(") else "%")
+        elif kind == "op" and value in ("+", "-") and unary:
+            out.append("−" if value == "-" else "+")
+        elif kind == "op" and value in _PRETTY_OPS:
+            out.append(f" {_PRETTY_OPS[value]} ")
+        elif kind == "op":
+            out.append(value)                       # ( ) ! °
+        elif kind == "word" and low in ("sqrt", "√"):
+            # √16 rather than √(16) when the root is of a single number.
+            if (i + 3 < n and tokens[i + 1] == ("op", "(")
+                    and tokens[i + 2][0] == "num" and tokens[i + 3] == ("op", ")")):
+                out.append("√" + tokens[i + 2][1])
+                prev, i = tokens[i + 3], i + 4
+                continue
+            out.append("√")
+        elif kind == "word" and low in ("pi", "π"):
+            out.append("π")
+        elif kind == "word" and low in ("tau", "τ"):
+            out.append("τ")
+        elif kind == "word" and low == "deg":
+            out.append("°")
+        elif kind == "word" and low in ("of", "von", "mod"):
+            out.append(f" {low} ")
+        elif kind == "word" and low != "e":
+            # A function name: "sin 30°" spaced, "sin(30°)" tight.
+            out.append(value if nxt == ("op", "(") else value + " ")
+        else:
+            out.append(value)
+        prev = (kind, value)
+        i += 1
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _pretty_value(value: str) -> str:
+    """The answer as the label shows it: a true minus, a superscript exponent."""
+    m = re.fullmatch(r"(.*? × 10)\^(-?\d+)(.*)", value)
+    if m:
+        value = m[1] + m[2].translate(_SUPERSCRIPT) + m[3]
+    return "−" + value[1:] if value.startswith("-") else value
+
+
+def answer_label(text: str, answer: str) -> str:
+    """What the answer row reads: "12 × 7 = 84", "5 km = 3.10686 miles"."""
+    try:
+        text = text.strip().rstrip("=").strip()
+        parts = _conversion_parts(text)
+        if parts and convert(text) is not None:
+            amount = _pretty_tokens(_calc_tokens(parts[0]))
+            return f"{amount} {parts[3]} = {_pretty_value(answer)}"
+        return f"{_pretty_tokens(_calc_tokens(text))} = {_pretty_value(answer)}"
+    except Exception:
+        return "= " + answer
+
 
 # How long a keystroke waits before it turns into a request.
 #
@@ -3783,6 +4400,35 @@ class DesktopIntegration:
         interp = "" if os.access(SELF_PATH, os.X_OK) else f"{sys.executable} "
         return f"{interp}{launcher}{extra}".strip()
 
+    # ── what a shortcut runs ─────────────────────────────────────────────
+    # A key used to run `halo.py --toggle`: a fresh Python whose only job is one
+    # D-Bus call to the copy already running. Even with the fast path skipping
+    # GTK, starting Python and importing gi/Gio is ~100ms of the keypress
+    # (measured: median 98ms on this machine, against 6ms for a bare
+    # interpreter) — the gap between pressing the key and the pill appearing.
+    #
+    # gdbus is a small C binary that ships with GLib, so it is on every GNOME
+    # desktop, and it makes the same call in a few milliseconds. When nothing
+    # is running the call fails at once (Halo installs no D-Bus service file,
+    # so the bus has nothing to start) and the command falls back to exactly
+    # what it used to run, which starts Halo.
+    #
+    # halo.py's path stays a separate argument ($0 of the little script), so
+    # _command_script() still finds it, a moved file is still noticed and
+    # repaired, and an older Halo reading this entry still recognises it.
+    _GDBUS_TOGGLE = ("gdbus call --session --dest {app} --object-path {path} "
+                     "--method org.freedesktop.Application.ActivateAction "
+                     "toggle '[]' '{{}}' >/dev/null 2>&1 || exec {interp}\"$0\" --toggle")
+
+    @classmethod
+    def _toggle_command(cls) -> str:
+        """The command a Halo shortcut runs. See _GDBUS_TOGGLE."""
+        interp = ("" if os.access(SELF_PATH, os.X_OK)
+                  else GLib.shell_quote(sys.executable) + " ")
+        script = cls._GDBUS_TOGGLE.format(
+            app=APP_ID, path="/" + APP_ID.replace(".", "/"), interp=interp)
+        return f"sh -c {GLib.shell_quote(script)} {GLib.shell_quote(str(SELF_PATH))}"
+
     @classmethod
     def icon_file(cls) -> Path:
         return cls.ICON_DIR / f"{APP_ID}.svg"
@@ -3968,6 +4614,32 @@ class DesktopIntegration:
             return False
 
     @classmethod
+    def upgrade_commands(cls) -> int:
+        """Bring Halo's own slots up to the current command. Returns how many.
+
+        Only slots Halo filed itself, only when they already point at this file,
+        and silently: nothing is being repaired, the key worked before and works
+        after, just sooner. A shortcut the user wrote by hand is theirs to spell
+        however they like, and a stale path is repair()'s job, which says so.
+        """
+        if not cls.shortcut_supported():
+            return 0
+        want = cls._toggle_command()
+        changed = 0
+        try:
+            for binding in cls.halo_bindings():
+                if (binding["ours"] and not binding["stale"]
+                        and binding["command"] != want):
+                    entry = Gio.Settings.new_with_path(cls.KEY_CHILD, binding["path"])
+                    entry.set_string("command", want)
+                    changed += 1
+            if changed:
+                Gio.Settings.sync()
+        except Exception:
+            pass
+        return changed
+
+    @classmethod
     def halo_bindings(cls) -> list[dict]:
         """Every custom keybinding that opens Halo, ours or hand-made.
 
@@ -4057,7 +4729,7 @@ class DesktopIntegration:
             for index, accel in enumerate(accels):
                 entry = Gio.Settings.new_with_path(cls.KEY_CHILD, cls._path_for(index))
                 entry.set_string("name", cls.ENTRY_NAME)
-                entry.set_string("command", cls._exec_command(" --toggle"))
+                entry.set_string("command", cls._toggle_command())
                 entry.set_string("binding", accel)
 
             # Blank every slot we are not using, plus Halo 1.0's single entry.
@@ -4998,7 +5670,7 @@ class ParkedArrow:
         self._visible = False
 
 
-class HaloWindow(Gtk.ApplicationWindow):
+class _InitMixin:
 
     def __init__(self, app: "HaloApp") -> None:
         super().__init__(application=app)
@@ -5083,6 +5755,9 @@ class HaloWindow(Gtk.ApplicationWindow):
         # as suggest_rows any more: the rows outlive the list being closed, so
         # the drawer has something to slide shut with — see _shut_suggestions().
         self._suggest_built: list[tuple] = []
+        # The quick answer's icon and hint while its row is built, for the
+        # moment of "Copied" after it is picked.
+        self._answer_widgets = None
         # The history dropdown: open or not, and the entries currently listed in
         # it, which is the filtered view rather than the whole store.
         self.history_open = False
@@ -5265,6 +5940,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
+class _BuildMixin:
+    # HaloWindow: building the pill, its menu and the page.
     # ── construction ────────────────────────────────────────────────────
     # Reveal timing.
     #
@@ -5900,6 +6577,9 @@ class HaloWindow(Gtk.ApplicationWindow):
         heading("BEHAVIOUR")
         toggle("Search suggestions", "Live autocomplete as you type",
                CFG["suggestions"], self._on_suggestions_toggled)
+        toggle("Quick answers", "Sums and unit conversions as the first "
+                                "suggestion, worked out on this computer",
+               CFG["quick_answers"], self._on_quick_answers_toggled)
         toggle("Remember position", "Reuse where you dragged it, instead of "
                                     "following the mouse",
                CFG["remember_position"],
@@ -6208,6 +6888,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         # how tall the window is — see the class for what that looked like.
         self.web_overlay.set_child(PanelClamp(self.web))
 
+class _EngineMixin:
+    # HaloWindow: releasing the engine; the page's own colour.
     # ── giving the engine back when nobody is using it ──────────────────
     #
     # Measured on this machine with a results-sized page loaded: the pill alone is
@@ -6671,6 +7353,8 @@ class HaloWindow(Gtk.ApplicationWindow):
             return
         self._history(-1 if button == self.MOUSE_BACK else 1)
 
+class _MoveResizeMixin:
+    # HaloWindow: resizing the panel; dragging the pill.
     # ── resizing the panel by its bottom edge and corners ───────────────
     #
     # Only while the results panel is open, and only along the bottom: the pill
@@ -7425,6 +8109,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         finally:
             gesture.reset()
 
+class _KeysMixin:
+    # HaloWindow: the keyboard.
     # ── keyboard ────────────────────────────────────────────────────────
     def _on_key(self, _c, keyval: int, _code: int, state: Gdk.ModifierType) -> bool:
         # The "Add a shortcut" dialog wants the raw keystroke, and this handler
@@ -7834,6 +8520,8 @@ class HaloWindow(Gtk.ApplicationWindow):
             listbox.select_row(row)
         return row
 
+class _EntryMixin:
+    # HaloWindow: the field, suggestions, the drawer and search history.
     # ── entry / suggestions ─────────────────────────────────────────────
     def _set_entry_text(self, text: str, notify: bool = True) -> None:
         """Put text in the field as one change, not as a delete and an insert.
@@ -7882,7 +8570,9 @@ class HaloWindow(Gtk.ApplicationWindow):
             # next keystroke instead of delaying the first list.
             if CFG["suggestions"] and text:
                 SUGGESTIONS.warm()
-            self._show_suggestions([])
+            # The quick answer needs nobody's permission to fetch anything, so
+            # it is not switched off with the suggestions.
+            self._show_suggestions(self._answer_rows(text))
             return
 
         known = SUGGESTIONS.cached(text)
@@ -7999,15 +8689,28 @@ class HaloWindow(Gtk.ApplicationWindow):
     # you see three of Google's suggestions rather than six.
     SUGGEST_ROWS = 6
 
+    def _answer_rows(self, text: str) -> list[tuple]:
+        """The quick answer for this text as a row of its own, or nothing."""
+        if not CFG["quick_answers"] or self.attached:
+            return []
+        answer = quick_answer(text)
+        # (value, ANSWER_ROW, label): the value is what Tab and copying use, the
+        # label is the sum it answers, typeset — "2¹⁰ = 1024". The label is part
+        # of the row so that a new sum with the same result still rebuilds it.
+        return [(answer, ANSWER_ROW, answer_label(text, answer))] if answer else []
+
     def _suggestion_rows(self, text: str, remote: list[str]) -> list[tuple]:
-        """Close past searches first, then Google's, without repeating either.
+        """The quick answer, then close past searches, then Google's.
 
         Two lists, one drawer, and the rows say which is which. Kept separate
         from the history drawer on purpose: that one is for browsing everything,
         this is for noticing that what you are typing is something you already
         looked up.
+
+        The answer goes first and counts against the same budget of rows, so
+        the drawer's height stays the constant SUGGEST_ROWS is there to keep.
         """
-        rows: list[tuple[str, bool]] = []
+        rows: list[tuple] = self._answer_rows(text)
         seen: set[str] = set()
         if CFG["history_in_suggestions"] and text:
             for entry in HISTORY.similar(text, self.HISTORY_IN_SUGGEST):
@@ -8035,10 +8738,12 @@ class HaloWindow(Gtk.ApplicationWindow):
         # both of them half visible.
         # Rows arrive either as plain strings or as (text, came-from-history)
         # pairs, so every existing caller and every test that passes a list of
-        # strings still means what it did.
-        rows = [(r, False) if isinstance(r, str) else (r[0], bool(r[1]))
+        # strings still means what it did. The answer row is the one triple.
+        rows = [(r, False) if isinstance(r, str)
+                else tuple(r[:3]) if r[1] == ANSWER_ROW
+                else (r[0], bool(r[1]))
                 for r in items]
-        texts = [text for text, _ in rows]
+        texts = [r[0] for r in rows]
         show = bool(rows) and not self.expanded and not self.history_open
         # An answer that came back empty in the middle of a word is not a reason
         # to shut the drawer. Type far enough into a word that Google runs out of
@@ -8211,19 +8916,36 @@ class HaloWindow(Gtk.ApplicationWindow):
         """Put a fresh set of rows in the list, replacing whatever was there."""
         while (child := self.suggest_list.get_first_child()) is not None:
             self.suggest_list.remove(child)
-        for text, from_history in rows:
+        self._answer_widgets = None
+        for entry in rows:
+            text, kind = entry[0], entry[1]
             row = Gtk.ListBoxRow()
             line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             # The same clock face the history drawer uses, so a row you have
             # seen before is recognisable without reading it.
             icon = Gtk.Image.new_from_icon_name(
-                "document-open-recent-symbolic" if from_history
+                "accessories-calculator-symbolic" if kind == ANSWER_ROW
+                else "document-open-recent-symbolic" if kind
                 else "system-search-symbolic")
             icon.add_css_class("halo-icon")
             line.append(icon)
-            label = Gtk.Label(label=text, xalign=0.0, hexpand=True)
-            label.set_ellipsize(Pango.EllipsizeMode.END)
+            shown = text
+            if kind == ANSWER_ROW:
+                shown = entry[2] if len(entry) > 2 and entry[2] else "= " + text
+            label = Gtk.Label(label=shown, xalign=0.0, hexpand=True)
+            # A long sum is cut at its start, so the answer is never what goes.
+            label.set_ellipsize(Pango.EllipsizeMode.START if kind == ANSWER_ROW
+                                else Pango.EllipsizeMode.END)
             line.append(label)
+            if kind == ANSWER_ROW:
+                label.add_css_class("halo-answer")
+                # Says what picking the row does, but only once it is picked
+                # or pointed at — a word on every answer would be clutter.
+                hint = Gtk.Label(label="Copy")
+                hint.add_css_class("halo-suggest-hint")
+                hint.add_css_class("halo-answer-hint")
+                line.append(hint)
+                self._answer_widgets = (icon, hint)
             row.set_child(line)
             self.suggest_list.append(row)
         self._suggest_built = list(rows)
@@ -8297,12 +9019,54 @@ class HaloWindow(Gtk.ApplicationWindow):
         while (child := self.suggest_list.get_first_child()) is not None:
             self.suggest_list.remove(child)
         self._suggest_built = []
+        self._answer_widgets = None
 
     def _on_suggest_activated(self, _list, row: Gtk.ListBoxRow) -> None:
         idx = row.get_index()
         if 0 <= idx < len(self.suggest_items):
+            if self._copy_answer(idx):
+                return
             self._set_entry_text(self.suggest_items[idx])
             self.run_search()
+
+    def _copy_answer(self, idx: int) -> bool:
+        """Copy the quick answer when that is the row picked. True if it was.
+
+        Picking the answer means wanting the number, not a search for it — the
+        query itself is still in the field and Enter still searches it. The
+        clipboard is only written because this row was chosen, and the row says
+        so the way the copy chip does: a tick, in green, for a moment.
+        """
+        if not (0 <= idx < len(self.suggest_rows)) \
+                or self.suggest_rows[idx][1] != ANSWER_ROW:
+            return False
+        value = self.suggest_rows[idx][0]
+        clipboard = self.get_clipboard()
+        try:
+            clipboard.set_content(
+                Gdk.ContentProvider.new_for_value(GObject.Value(str, value)))
+        except Exception:
+            try:
+                clipboard.set(value)
+            except Exception:
+                return True
+        if self._answer_widgets:
+            icon, hint = self._answer_widgets
+            icon.set_from_icon_name("object-select-symbolic")
+            icon.add_css_class("halo-copied")
+            hint.set_label("Copied")
+            hint.add_css_class("halo-copied")
+
+            def settle(widgets=self._answer_widgets) -> bool:
+                icon, hint = widgets
+                icon.set_from_icon_name("accessories-calculator-symbolic")
+                icon.remove_css_class("halo-copied")
+                hint.set_label("Copy")
+                hint.remove_css_class("halo-copied")
+                return False
+
+            GLib.timeout_add(self.COPIED_MS, settle)
+        return True
 
     # ── search history ──────────────────────────────────────────────────
     #
@@ -8762,6 +9526,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         elif bottom > adj.get_value() + page:
             adj.set_value(bottom - page)
 
+class _SearchMixin:
+    # HaloWindow: searching, find in page, undoing a spelling correction.
     # ── searching ───────────────────────────────────────────────────────
     def run_search(self) -> None:
         if self.finding:
@@ -8787,6 +9553,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         row = self.suggest_list.get_selected_row()
         if row and self.suggest_reveal.get_reveal_child() and self.suggest_items:
             idx = row.get_index()
+            if self._copy_answer(idx):
+                return
             if 0 <= idx < len(self.suggest_items):
                 self._set_entry_text(self.suggest_items[idx])
 
@@ -9427,6 +10195,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         else:
             self._set_busy(False)
 
+class _LensMixin:
+    # HaloWindow: the picture clipped to the field (Lens).
     # ── the picture clipped to the search field ─────────────────────────
     #
     # Every way of searching a picture used to leave the pill looking exactly
@@ -10467,6 +11237,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         self._cancel_lens_timers()
         self._reset_placeholder()
 
+class _ContextMenuMixin:
+    # HaloWindow: the right-click menu and what it does.
     # ── the right-click menu ────────────────────────────────────────────
     #
     # WebKit's stock menu was wrong for Halo in three ways at once, and all three
@@ -11459,6 +12231,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         self.load_lens(str(path))
         return True
 
+class _PageMixin:
+    # HaloWindow: WebView callbacks; expanding and collapsing.
     # ── webview callbacks ───────────────────────────────────────────────
     def _on_lens_results(self) -> bool:
         """Is the view actually showing Lens' results, rather than its uploader?"""
@@ -12329,6 +13103,8 @@ class HaloWindow(Gtk.ApplicationWindow):
     # panel with the pill 200px from the bottom edge, which came back flush with the
     # bottom rather than overflowing. All we add is the way back.
 
+class _GeometryMixin:
+    # HaloWindow: placement, on-top, the pointer's size.
     # ── geometry: placement, on-top, click-through margin ───────────────
     def _xid(self) -> int | None:
         """Our X11 window id, cached per surface.
@@ -13237,6 +14013,8 @@ class HaloWindow(Gtk.ApplicationWindow):
             return [x, y]                       # legacy: already device
         return [x * max(1, int(scale)), y * max(1, int(scale))]
 
+class _ShowHideMixin:
+    # HaloWindow: showing and hiding; the shortcut pressed twice.
     # ── show / hide ─────────────────────────────────────────────────────
     def show_popup(self, reposition: bool = True) -> None:
         self._cancel_idle_release()
@@ -13811,6 +14589,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         self.hide_popup()
         return True     # never destroy; the daemon stays warm
 
+class _MenuMixin:
+    # HaloWindow: the ⋯ menu's actions, setup, the user's own keys.
     # ── menu actions ────────────────────────────────────────────────────
     def _refresh_setup_status(self, sync_checks: bool = True) -> None:
         """Re-sync the menu with reality, including who owns which key.
@@ -14618,6 +15398,8 @@ class HaloWindow(Gtk.ApplicationWindow):
         # may not have caught up yet.
         GLib.idle_add(self._refresh_setup_status, False)
 
+class _InfoMixin:
+    # HaloWindow: the manual dialog.
     # ── information ─────────────────────────────────────────────────────
     # Grouped rather than one flat run of twenty-odd rows, which read as a wall
     # and buried the useful half. The arrows appear under more than one heading on
@@ -15162,6 +15944,10 @@ class HaloWindow(Gtk.ApplicationWindow):
         # effect without waiting for another keystroke.
         self._on_entry_changed()
 
+    def _on_quick_answers_toggled(self, state: bool) -> None:
+        CFG["quick_answers"] = state
+        self._on_entry_changed()       # the same reason as the switch above
+
     def _on_retention_changed(self, picker: Gtk.DropDown, _p) -> None:
         idx = picker.get_selected()
         if not (0 <= idx < len(self.retention_options)):
@@ -15256,6 +16042,26 @@ class HaloWindow(Gtk.ApplicationWindow):
             pass
         CFG["warmed_up"] = False
         _notify(APP_NAME, "Cookies and cache cleared.")
+
+
+class HaloWindow(_InitMixin,
+                 _BuildMixin,
+                 _EngineMixin,
+                 _MoveResizeMixin,
+                 _KeysMixin,
+                 _EntryMixin,
+                 _SearchMixin,
+                 _LensMixin,
+                 _ContextMenuMixin,
+                 _PageMixin,
+                 _GeometryMixin,
+                 _ShowHideMixin,
+                 _MenuMixin,
+                 _InfoMixin,
+                 Gtk.ApplicationWindow):
+    """The pill, its panel and the page — assembled from the mixins above,
+    one per part of src/window/. They share one instance and call into each
+    other freely; the split is only so a part can be read on its own."""
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -15356,6 +16162,10 @@ class HaloApp(Adw.Application):
         """
         try:
             fixed = DesktopIntegration.repair()
+            # After repair, so a slot repair has just rewritten is already new;
+            # this only catches the keys that were right but spelled the old,
+            # slower way, and it says nothing because nothing was wrong.
+            DesktopIntegration.upgrade_commands()
         except Exception:
             return False
         if fixed:

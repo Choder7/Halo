@@ -49,6 +49,7 @@ Press Enter and it unfolds into Google:
 
 - Floats above every window when activated.
 - Results open **inside** it, no need to launch your browser for a quick question.
+- Sums and unit conversions get answered right in the suggestions (`12*7`, `5 km in miles`).
 - Nice theme.
 - (Tells Google to deny the cookie popup).
 - Goes away on Esc or keybind.
