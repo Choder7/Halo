@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.36.1
+
+Fixed
+- Closing Halo now really pauses embedded videos, instead of muting them so they carry on and are heard again when Halo opens
+- Videos no longer play silently after reopening Halo
+
 ## 1.36.0
 
 Added

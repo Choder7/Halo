@@ -78,7 +78,7 @@ from pathlib import Path
 
 APP_ID = "io.github.choder7.Halo"
 APP_NAME = "Halo"
-VERSION = "1.36.0"
+VERSION = "1.36.1"
 
 AUTHOR = "Choder7"
 PROJECT_URL = "https://github.com/Choder7/Halo"
@@ -2618,9 +2618,48 @@ AUDIO_HOOK_JS = r"""
     }
     live = keep;
   }
+  /* The view mute leaks into the page, and this is what takes it back out.
+     set_is_muted() is meant to sit above the page, but WebKit's GStreamer player
+     reports the mute back up as the ELEMENT's own `muted` — late, landing about
+     3ms after show_popup() takes the view mute off — and from then on the video
+     is muted in its own right: Play after reopening was silent, the stream
+     muted at PipeWire, in 2 runs of 4, on 1.36.0 as shipped.
+     So: note at hush which elements could be heard, and at wake give back any of
+     those that come back muted — those, and only those, so a video the user
+     muted stays muted; and only for GUARD_MS, while the panel is still shut and
+     there is no page on screen to press mute on. Not gated on
+     navigator.userActivation, which looks like the way to tell a user's mute
+     from the bounce and is not: evaluate_javascript() runs as a user gesture,
+     so WAKE_MEDIA_JS itself makes it true for the whole window, and the version
+     that asked it never gave anything back. */
+  var audible = [], guardUntil = 0, GUARD_MS = 1500;
+  function noteAudible() {
+    audible = [];
+    try {
+      var media = document.querySelectorAll('video, audio');
+      for (var i = 0; i < media.length; i++) {
+        try { if (!media[i].muted) { audible.push(box(media[i])); } } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  function wasAudible(el) {
+    for (var i = 0; i < audible.length; i++) {
+      if (deref(audible[i]) === el) { return true; }
+    }
+    return false;
+  }
+  function giveBack(el) {
+    try { if (el && el.muted) { el.muted = false; } } catch (e) {}
+  }
+  try {
+    document.addEventListener('volumechange', function (e) {
+      if (Date.now() <= guardUntil && wasAudible(e.target)) { giveBack(e.target); }
+    }, true);
+  } catch (e) {}
   var api = {
     hush: function () {
       prune();
+      if (!audible.length) { noteAudible(); }
       var n = 0;
       for (var i = 0; i < live.length; i++) {
         var c = deref(live[i]);
@@ -2642,6 +2681,12 @@ AUDIO_HOOK_JS = r"""
         try { held[i].resume(); } catch (e) {}
       }
       held.length = 0;
+      // Whatever already bounced, now; whatever is still on its way, as it lands.
+      for (var k = 0; k < audible.length; k++) { giveBack(deref(audible[k])); }
+      guardUntil = Date.now() + GUARD_MS;
+      setTimeout(function () {
+        if (Date.now() > guardUntil) { audible = []; }
+      }, GUARD_MS + 100);
       return n;
     }
   };
@@ -2649,6 +2694,62 @@ AUDIO_HOOK_JS = r"""
     Object.defineProperty(window, '__haloQuiet',
                           {value: api, enumerable: false, configurable: true});
   } catch (e) { window.__haloQuiet = api; }
+  /* The way in for a frame STOP_MEDIA_JS cannot script. A cross-origin frame
+     throws on the first property touched, so from the top it can be neither
+     walked nor told to hush — but it can be posted to, and this is there to
+     listen. Before it existed such a frame was only ever muted: measured, a
+     video in one went on playing behind the dismissed pill (t=2.2s, 5.0s, 7.0s,
+     13.0s) and came back audible, further on, the moment the pill was summoned
+     and the mute came off — which is exactly what "it resumes the video when I
+     open Halo" was.
+     Only an ANCESTOR is listened to. That is who STOP_MEDIA_JS and the frames
+     between it and us post as, and nobody else has any business asking. And the
+     message stops here: captured, first, and not propagated, so the page's own
+     listeners never see a message that was never meant for them. */
+  function hereAndBelow(word) {
+    var n = 0;
+    if (word === 'hush') {
+      try {
+        var media = document.querySelectorAll('video, audio');
+        for (var i = 0; i < media.length; i++) {
+          try {
+            if (!media[i].paused && !media[i].ended) { media[i].pause(); n++; }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      n += api.hush();
+      try {
+        if (navigator.mediaSession) { navigator.mediaSession.playbackState = 'none'; }
+      } catch (e) {}
+    } else {
+      api.wake();
+    }
+    for (var k = 0; k < window.frames.length; k++) {
+      try { window.frames[k].postMessage({haloMedia: word}, '*'); } catch (e) {}
+    }
+    return n;
+  }
+  function fromAncestor(source) {
+    for (var w = window; w !== w.parent; ) {
+      w = w.parent;
+      if (source === w) { return true; }
+    }
+    return false;
+  }
+  try {
+    window.addEventListener('message', function (e) {
+      var word = e.data && e.data.haloMedia;
+      if ((word !== 'hush' && word !== 'wake') || !fromAncestor(e.source)) { return; }
+      e.stopImmediatePropagation();
+      var n = hereAndBelow(word);
+      /* Said out loud only when something was actually stopped: it is what lets
+         a page whose only player is embedded be let go as soon as one whose
+         player is not — see _on_page_message. */
+      if (n > 0) {
+        try { window.webkit.messageHandlers.halo.postMessage('hushed ' + n); } catch (e2) {}
+      }
+    }, true);
+  } catch (e) {}
   ['AudioContext', 'webkitAudioContext'].forEach(function (name) {
     var Real = window[name];
     if (typeof Real !== 'function') { return; }
@@ -2681,8 +2782,12 @@ AUDIO_HOOK_JS = r"""
 # at the top document left an embedded player running with the pill dismissed —
 # measured, an iframe's <audio> still reporting playing six seconds after the
 # pill was gone — and most video on the web is in an iframe. Cross-origin frames
-# throw on the first property touched and are skipped; nothing can script those,
-# which is what set_is_muted() is for.
+# throw on the first property touched, so those are posted a message instead and
+# AUDIO_HOOK_JS, which is in every frame, stops them from the inside. Skipping
+# them, which is what this used to do, left them only muted: still playing, and
+# audible again — further on — the moment the pill came back and the mute came
+# off.
+#
 # What WebKit's find leaves on the page is the document's own selection — the
 # grey box behind the current match. search_finish() ends the find operation but
 # does NOT drop that selection: verified by rendering the panel before and after
@@ -2708,7 +2813,13 @@ STOP_MEDIA_JS = r"""
           }
         } catch (e) {}
       }
-    } catch (e) { return; }   // cross-origin: not ours to touch, and muted anyway
+    } catch (e) {
+      // Cross-origin: not ours to walk, so it is asked instead, and AUDIO_HOOK_JS
+      // in that frame does the stopping — for it and for everything inside it.
+      // It cannot add to the count from there, so it reports on its own.
+      try { w.postMessage({haloMedia: 'hush'}, '*'); } catch (e2) {}
+      return;
+    }
     try { if (w.__haloQuiet) { stopped += w.__haloQuiet.hush(); } } catch (e) {}
     try {
       for (var k = 0; k < w.frames.length; k++) { quiet(w.frames[k], depth + 1); }
@@ -2733,7 +2844,12 @@ WAKE_MEDIA_JS = r"""
   var woken = 0;
   function wake(w, depth) {
     if (depth > 6) { return; }
-    try { if (w.__haloQuiet) { woken += w.__haloQuiet.wake(); } } catch (e) { return; }
+    try { if (w.__haloQuiet) { woken += w.__haloQuiet.wake(); } } catch (e) {
+      // Cross-origin, and since STOP_MEDIA_JS reaches those now, so must this:
+      // a context suspended in there and never woken is sound gone for good.
+      try { w.postMessage({haloMedia: 'wake'}, '*'); } catch (e2) {}
+      return;
+    }
     try {
       for (var k = 0; k < w.frames.length; k++) { wake(w.frames[k], depth + 1); }
     } catch (e) {}
@@ -7050,11 +7166,14 @@ class _EngineMixin:
         """Put the page down once nobody is watching.
 
         Two mechanisms, because neither is enough on its own. Muting the view is
-        immediate, total and needs nobody's cooperation — it is the only thing
-        that reaches a cross-origin frame, which is where most video on the web
-        actually lives. And asking the page to stop is what makes it a pause
-        rather than a gag: a muted video still decodes every frame, still holds
-        the engine, and is still listed by the desktop as something playing.
+        immediate, total and needs nobody's cooperation — it lands before any
+        round trip, and in a frame whose page ignores the request. And asking
+        the page to stop is what makes it a pause rather than a gag: a muted
+        video still decodes every frame, still holds the engine, is still listed
+        by the desktop as something playing — and is audible again, further on,
+        the moment show_popup() takes the mute off. That reaches cross-origin
+        frames too, which is where most video on the web lives: see
+        AUDIO_HOOK_JS.
         """
         if self.web is None:
             return
@@ -7071,14 +7190,8 @@ class _EngineMixin:
                 stopped = int(float(value.to_string())) if value else 0
             except Exception:
                 return
-            if stopped <= 0 or self.get_visible():
-                return
-            wait = self._media_idle_wait()
-            if wait is None:
-                return
-            self._cancel_idle_release()
-            self._idle_timer = GLib.timeout_add_seconds(wait,
-                                                        self._idle_release_due)
+            if stopped > 0:
+                self._paused_media()
 
         try:
             self.web.evaluate_javascript(STOP_MEDIA_JS, -1, None, None, None,
@@ -7086,12 +7199,28 @@ class _EngineMixin:
         except Exception:
             pass
 
+    def _paused_media(self) -> None:
+        """Something was playing when the pill went, and has been paused.
+
+        Called with the top document's count, and again by any cross-origin
+        frame that stopped something of its own — those can only say so
+        afterwards, over the message handler, which is why this is not inline.
+        """
+        if self.get_visible():
+            return
+        wait = self._media_idle_wait()
+        if wait is None:
+            return
+        self._cancel_idle_release()
+        self._idle_timer = GLib.timeout_add_seconds(wait, self._idle_release_due)
+
     def _wake_page(self) -> None:
         """Undo _quiet_page(), as far as it is ours to undo.
 
         The mute comes off, and the AudioContexts we suspended are resumed —
         those, and only those, so a context the page had suspended itself is not
-        started by us coming back.
+        started by us coming back. Any element the view mute leaked into gets
+        its own sound back too, in every frame; AUDIO_HOOK_JS says how it leaks.
 
         Media elements are deliberately *not* resumed. A video that starts
         playing again because the search pill was summoned is a surprise, and
@@ -9806,6 +9935,9 @@ class _SearchMixin:
             return
         if text.startswith("spell "):
             self._adopt_spelling(text[6:])
+            return
+        if text.startswith("hushed "):
+            self._paused_media()
             return
         if text != "painted":
             return
