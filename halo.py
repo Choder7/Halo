@@ -78,7 +78,7 @@ from pathlib import Path
 
 APP_ID = "io.github.choder7.Halo"
 APP_NAME = "Halo"
-VERSION = "1.36.1"
+VERSION = "1.36.2"
 
 AUTHOR = "Choder7"
 PROJECT_URL = "https://github.com/Choder7/Halo"
@@ -3291,6 +3291,8 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".jfif", ".webp", ".gif", ".bmp",
 #    gdk_x11_drag_handle_finished() — the only caller of gdk_drag_drop_done(),
 #    which is the only thing that hides the drag surface — never runs. The
 #    picture hangs there until Halo is closed.
+#    Drags that do not start in a page, or whose page keeps its dragstart to
+#    itself, are finished natively instead: see _wire_page_drop_finish().
 #
 # Both are answered from inside the page, with the two web APIs that exist for
 # exactly this. setDragImage() replaces the icon with a thumbnail Halo sizes;
@@ -6966,6 +6968,7 @@ class _BuildMixin:
         self.web = WebKit.WebView(network_session=session, settings=settings,
                                   user_content_manager=ucm, vexpand=True)
         self.web.add_css_class("halo-web")
+        self._watch_page_drops(self.web)
         # Opaque, in the page's own colour — NOT transparent. A transparent base
         # let the slab's sheen gradient show through everything the page does not
         # paint itself, and the scroll gutter is exactly that: an 11px strip down
@@ -7443,7 +7446,96 @@ class _EngineMixin:
 
         self._wire_entry_drag()
         self._wire_entry_drop()
+        self._wire_page_drop_finish()
         self._wire_mouse()
+
+    # ── finishing the drops the page could not ──────────────────────────
+    #
+    # WebKit ends every drop on the page with
+    #     gdk_drop_finish(drop, gdk_drop_get_actions(drop))
+    # — still so in 2.54.1 — and GDK refuses any mask with more than one bit in
+    # it. The drop is then never finished, no XdndFinished goes back, and the
+    # drag icon stays on screen until the process that started the drag exits.
+    # DRAG_JS answers that for drags that start in a page, but only those, and
+    # only when the page lets its dragstart reach the document. Everything else
+    # still got stuck. The one that was reported: words selected in the search
+    # field and dragged onto the page. GtkText starts that drag as COPY|MOVE,
+    # its icon is the words themselves, and it hung over the desktop after the
+    # pill was dismissed. Measured with a real injected pointer drag into a
+    # textarea: the text went in, the CRITICAL was logged, and the icon was
+    # still mapped two seconds later.
+    #
+    # So it is finished here, once WebKit has done with it. A capture-phase
+    # controller on the view notes any drop whose mask GDK will refuse. Only
+    # WebKit's own target can be the one that failed it: if WebKit declines a
+    # drop, the drop bubbles on up to this window, where the sentinel below
+    # forgets it again, because the window's own target finishes it properly.
+    # Whatever is still noted when the dispatch is over is WebKit's, unfinished,
+    # and gets finished with one action.
+    #
+    # The sentinel is on the window and not the view because GTK runs a
+    # widget's controllers newest first: one added to the view after WebKit's
+    # target would see the drop before WebKit did, not after.
+    #
+    # COPY when it is on offer. WebKit has already done whatever it did with
+    # the words; all the action tells the source is whether to delete its own
+    # copy, and a MOVE out of the search field would empty the query someone
+    # had just dragged a piece of. A drag that is Halo's own and that WebKit
+    # turned down (selected action none) is finished as failed, which slides
+    # the icon back the way a refused drop should.
+
+    def _wire_page_drop_finish(self) -> None:
+        self._page_drop = None
+        declined = Gtk.EventControllerLegacy()
+        declined.connect("event", self._on_page_drop_declined)
+        self.add_controller(declined)
+
+    def _watch_page_drops(self, web) -> None:
+        """Hook a freshly built view up to _settle_page_drop()."""
+        watch = Gtk.EventControllerLegacy()
+        watch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        watch.connect("event", self._on_page_drop_start)
+        web.add_controller(watch)
+
+    @staticmethod
+    def _drop_starting(controller):
+        # The event comes through the controller, not the signal: PyGObject
+        # hands GtkEventControllerLegacy's GdkEvent argument over as None.
+        event = controller.get_current_event()
+        if event is None or event.get_event_type() != Gdk.EventType.DROP_START:
+            return None
+        return event.get_drop()
+
+    def _on_page_drop_start(self, controller, _event) -> bool:
+        drop = self._drop_starting(controller)
+        if drop is not None and not Gdk.drag_action_is_unique(drop.get_actions()):
+            self._page_drop = drop
+            GLib.idle_add(self._settle_page_drop, drop)
+        return False                # WebKit still gets the drop
+
+    def _on_page_drop_declined(self, controller, _event) -> bool:
+        if self._drop_starting(controller) is not None:
+            self._page_drop = None
+        return False
+
+    def _settle_page_drop(self, drop) -> bool:
+        if self._page_drop is not drop:
+            return False
+        self._page_drop = None
+        actions = drop.get_actions()
+        drag = drop.get_drag()      # Halo's own drag, or None for another app's
+        action = Gdk.DragAction(0)
+        if drag is None or drag.get_selected_action():
+            for one in (Gdk.DragAction.COPY, Gdk.DragAction.MOVE,
+                        Gdk.DragAction.LINK):
+                if actions & one:
+                    action = one
+                    break
+        try:
+            drop.finish(action)
+        except Exception:
+            pass
+        return False
 
     # Buttons 8 and 9 are back and forward on every mouse that has them. GTK
     # hands them through as plain button numbers and WebKit does nothing with
