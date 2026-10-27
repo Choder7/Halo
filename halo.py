@@ -78,7 +78,7 @@ from pathlib import Path
 
 APP_ID = "io.github.choder7.Halo"
 APP_NAME = "Halo"
-VERSION = "1.36.2"
+VERSION = "1.37.0"
 
 AUTHOR = "Choder7"
 PROJECT_URL = "https://github.com/Choder7/Halo"
@@ -140,6 +140,7 @@ DEFAULTS = {
     "history": True,             # keep a list of what has been searched
     "history_in_suggestions": True,   # surface close past searches while typing
     "quick_answers": True,       # sums and conversions as the first suggestion
+    "page_zoom": 1.0,            # the panel's page zoom, Ctrl + + / − / 0
     "history_days": 60,          # forget entries older than this; 0 keeps them
     # The picture the pill is carrying, as {"path", "name", "uri", "origin"} —
     # or None. State rather than a setting, and kept here for the same reason
@@ -166,6 +167,20 @@ DEFAULTS = {
     # frame is already right. _adopt_page_bg() still asks the page and still
     # wins, so a Google restyle simply overwrites this on the next load.
     "page_bg": None,
+    # Whether a Halo shortcut has ever been seen in dconf. Until one has, an
+    # empty dconf means "not set up yet", and the ticks keep "shortcuts" above
+    # — the default Super+G — as the plan "Set up Halo…" will bind. Once one
+    # has, an empty dconf means the user removed them, and Halo follows GNOME.
+    # Without the difference, opening the ⋯ menu on a fresh install unticked
+    # Super+G before anyone saw it, and setup could never bind a key at all.
+    "shortcuts_seen": False,
+    # Whether "Set up Halo…" has done its job: None until first asked (an
+    # older install is then judged by what is on disk), False on a fresh
+    # install, True once set up. While False, keys ticked in the menu do not
+    # end the "fresh" state — a tick writes its shortcut at once, and that
+    # used to turn the button into "Check…" before it had switched anything
+    # else on.
+    "setup_done": None,
 }
 
 # Offered in the settings menu. The Copilot key on newer keyboards sends
@@ -1034,9 +1049,18 @@ class Config:
         going back to an older version does not lose its settings.
         """
         def number(key: str, low, high, cast) -> None:
+            # OverflowError and the finiteness test as well, because Python's
+            # json reads `Infinity`, `NaN` and `1e999` without complaint and
+            # writes the first two itself. int(inf) raises OverflowError, which
+            # nothing here caught, and this runs at import — so one bad number
+            # in a hand-edited file meant Halo did not start at all, from the
+            # shortcut silently. A float NaN sails through the clamp instead,
+            # since every comparison with it is false.
             try:
                 value = cast(self.data.get(key, DEFAULTS[key]))
-            except (TypeError, ValueError):
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError(key)
+            except (TypeError, ValueError, OverflowError):
                 value = DEFAULTS[key]
             self.data[key] = max(low, min(high, value))
 
@@ -1052,10 +1076,16 @@ class Config:
         # A second is already absurd for a drawer; past that it is a fault, not
         # a preference.
         number("reveal_ms", 0, 1000, int)
+        # The ends of the zoom steps, and a zoom outside them is a typo.
+        number("page_zoom", 0.5, 3.0, float)
         for key in ("suggestions", "remember_position", "safe_search",
                     "compact_results", "warmed_up", "history",
                     "history_in_suggestions", "parked_arrow", "quick_answers"):
             self.data[key] = bool(self.data.get(key, DEFAULTS[key]))
+        # Bookkeeping about the shortcuts rather than settings — see DEFAULTS.
+        self.data["shortcuts_seen"] = bool(self.data.get("shortcuts_seen"))
+        if self.data.get("setup_done") not in (None, True, False):
+            self.data["setup_done"] = None
 
         # A remembered attachment names a file, and a file can be deleted
         # between two runs. Anything that is not a dict with a usable path is
@@ -1096,9 +1126,12 @@ class Config:
             if r * 0.299 + g * 0.587 + b * 0.114 <= 0.35:
                 self.data["page_bg"] = remembered.lower()
 
+        # Finite, for the reason number() gives: int() of NaN or Infinity raises,
+        # and here it raised at import.
         position = self.data.get("position")
         if (isinstance(position, (list, tuple)) and len(position) == 2
-                and all(isinstance(v, (int, float)) for v in position)):
+                and all(isinstance(v, (int, float)) and math.isfinite(v)
+                        for v in position)):
             self.data["position"] = [int(position[0]), int(position[1])]
         else:
             self.data["position"] = None
@@ -1129,11 +1162,32 @@ class Config:
         self.data[key] = value
         self.save()
 
+    def reset(self) -> None:
+        """Back to the defaults, in memory only — nothing is written.
+
+        For "Remove everything", which has just deleted the file: the settings
+        it held must not come back with the next unrelated write, and writing
+        the defaults now would recreate the very file the user asked to lose.
+        """
+        self.data = dict(DEFAULTS)
+        self._sanitise()
+
     def save(self) -> None:
+        """Write via a temporary file, as the search history always has.
+
+        This used to write config.json in place, and it is written often — on
+        a hide with "remember position" on, on every attached picture, on a
+        change of Google's shade. A crash or a full disk between the truncate
+        and the write left a short file, and a file that does not parse is
+        read as "no settings at all", silently: every key, every switch and
+        the handshake flag back to their defaults.
+        """
         try:
             _own_dir(CONFIG_DIR)
-            CONFIG_FILE.write_text(json.dumps(self.data, indent=2))
-            _own_file(CONFIG_FILE)
+            tmp = CONFIG_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.data, indent=2))
+            _own_file(tmp)          # before the rename, so it is never briefly loose
+            tmp.replace(CONFIG_FILE)
         except Exception:
             pass
 
@@ -1306,13 +1360,18 @@ class SearchHistory:
         query = entry.get("q")
         if not isinstance(query, str) or not query.strip():
             return None
+        # Finite, and OverflowError caught: json reads Infinity, NaN and 1e999,
+        # int(inf) raises OverflowError, and a NaN timestamp sorts nowhere in
+        # particular and is never pruned.
         try:
             at = float(entry.get("at") or 0)
-        except (TypeError, ValueError):
+            if not math.isfinite(at):
+                at = 0.0
+        except (TypeError, ValueError, OverflowError):
             at = 0.0
         try:
             hits = max(1, int(entry.get("n") or 1))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             hits = 1
         kind = entry.get("kind")
         kind = kind if kind in ("url", "image") else "search"
@@ -1420,6 +1479,30 @@ class SearchHistory:
     def flush(self) -> None:
         if self._save_timer:
             self._write()
+
+    def save_now(self) -> None:
+        """Write the list as it stands, pending timer or not.
+
+        flush() only writes what a debounce is holding, and prune() arms no
+        debounce — so shortening "Forget after" pruned the list in memory and
+        flush() then had nothing to do: the forgotten searches stayed in
+        history.json until some later search happened to rewrite it.
+        """
+        self._write()
+
+    def discard(self) -> None:
+        """Forget everything in memory and write nothing at all.
+
+        For "Remove everything", which deletes the file itself. clear() writes
+        an empty list first, and that recreates the data folder that was just
+        removed; leaving the list in memory instead put every past search back
+        on disk with the next one.
+        """
+        if self._save_timer:
+            GLib.source_remove(self._save_timer)
+            self._save_timer = 0
+        self.items = []
+        self._tok_cache.clear()
 
     # ── contents ────────────────────────────────────────────────────────
     def add(self, query: str, kind: str = "search",
@@ -1593,8 +1676,8 @@ MARK_PX = 20                # the Google mark's drawn size. Anything up to the
                             # BAR_HEIGHT; past that the pill grows to suit.
 
 # The colour Google's own dark results page paints itself. Everything behind the
-# page — the results toolbar, the loading cover, the WebView's own base, and
-# therefore the scroll gutter — is painted in exactly this, so the panel reads as
+# page — the results toolbar, the loading cover and the WebView's own base — is
+# painted in exactly this, so the panel reads as
 # one continuous surface and none of the pill's sheen wraps around the results.
 # It is only a starting value: _adopt_page_bg() samples the real page after every
 # load and follows it, so a Google restyle cannot leave a mismatched band behind.
@@ -2017,9 +2100,9 @@ button.halo-hist-del:hover {
 
    The whole panel is a flat sheet in Google's own page colour — deliberately
    NOT the pill's translucent gradient. The WebView's base is the same colour,
-   so the transparent scroll gutter shows this and nothing else: previously the
-   pill's 158° sheen shone through the gutter, brightest at the top, and read as
-   a stray light line running down the side of the results. */
+   so whatever the page leaves unpainted shows this and nothing else: previously
+   the pill's 158° sheen shone through the scroll gutter, brightest at the top,
+   and read as a stray light line running down the side of the results. */
 .halo-results { background-color: @halo_page; }
 .halo-toolbar {
   /* 3px, not 5: the chips are 30px tall and carry their own optical padding, so
@@ -2411,13 +2494,18 @@ CONSENT_JS = r"""
 })();
 """
 
-# Cosmetics only: match WebKit's scrollbars to the popup instead of the
-# stock light ones, and stop Google's own page background from punching a
-# bright rectangle through our rounded corners.
+# Cosmetics only: the dark colour scheme Google's page is shown in, and scrolls
+# that land instead of gliding.
 #
-# The gutter is left transparent on purpose: the WebView's base is painted in the
-# page's own colour (see _adopt_page_bg), so an unstyled gutter reads as more
-# page rather than as a channel with its own shade.
+# No scrollbar styling, on purpose. It used to restyle them here — slim, with a
+# transparent track — from when WebKit's own were solid light bars. WebKit now
+# draws GNOME's overlay scrollbars, which take no room and suit the page under
+# them; styling them turns them back into classic ones with an 11px track down
+# the right and along the bottom. On Google that track showed the view's base in
+# Google's own shade and could not be seen. On a light page wider than the
+# panel — amazon.de — it was a bar down the side, another along the bottom and
+# a dark square where they met, and the white thumb was all but invisible on
+# white. Someone who has asked GNOME to always show scrollbars still gets them.
 POLISH_CSS = """
 html { color-scheme: dark; }
 
@@ -2435,38 +2523,6 @@ html { color-scheme: dark; }
    only half the job — a script that asks for {behavior:'smooth'} outright wins
    over this property by definition, which is why HOLD_SCROLL_JS exists. */
 * { scroll-behavior: auto !important; }
-::-webkit-scrollbar {
-  width: 11px;
-  height: 11px;
-  background-color: transparent;
-}
-/* Styling ::-webkit-scrollbar does not stop WebKit reserving its stepper
-   buttons, and an unstyled button paints as a small block at the very top of the
-   track — the stray line at the top of the scrollbar. Nothing else removes it:
-   the buttons have to be given no box at all. */
-::-webkit-scrollbar-button,
-::-webkit-scrollbar-button:start,
-::-webkit-scrollbar-button:end {
-  display: none;
-  width: 0;
-  height: 0;
-}
-::-webkit-scrollbar-track,
-::-webkit-scrollbar-track-piece {
-  background-color: transparent;
-  border: none;
-  box-shadow: none;
-}
-::-webkit-scrollbar-thumb {
-  background-color: rgba(255,255,255,0.18);
-  border-radius: 6px;
-  border: 3px solid transparent;
-  background-clip: content-box;
-  box-shadow: none;
-}
-::-webkit-scrollbar-thumb:hover { background-color: rgba(255,255,255,0.30);
-  border: 3px solid transparent; background-clip: content-box; }
-::-webkit-scrollbar-corner { background-color: transparent; }
 """
 
 # Make every programmatic scroll land instantly.
@@ -2524,6 +2580,39 @@ SCROLL_JS = r"""
   window.addEventListener('scroll', tell, {passive: true});
   window.addEventListener('load', tell);
   tell();
+
+  /* ...and whether the caret is somewhere that uses keys itself: a text field,
+     a <select>, an editor, a player, a widget that answers arrows. Halo's own
+     shortcuts step aside there — ↑ at the top of a page is the way back to the
+     search field, and in a comment box it is the line above. A frame counts:
+     whatever has the caret inside it cannot be seen from here, and the page
+     keeping its keys is the answer that cannot break anything. */
+  var editing = null;
+  var busy = function (e) {
+    if (!e || e === document.body || e === document.documentElement) return false;
+    if (e.isContentEditable) return true;
+    var tag = e.tagName;
+    if (/^(TEXTAREA|SELECT|IFRAME|FRAME|VIDEO|AUDIO|EMBED|OBJECT)$/.test(tag)) return true;
+    if (tag === 'INPUT') {
+      return !/^(button|submit|reset|checkbox|radio|image|file|hidden|color)$/
+        .test((e.type || 'text').toLowerCase());
+    }
+    var role = (e.getAttribute('role') || '').toLowerCase();
+    if (/^(textbox|searchbox|combobox|listbox|slider|spinbutton|menu|menubar|menuitem|grid|tree|treegrid|tablist|application)$/.test(role)) return true;
+    /* A player is usually a focusable box with the video inside it. */
+    return !!(e.querySelector && e.querySelector('video, audio'));
+  };
+  var report = function () {
+    var now = busy(document.activeElement);
+    if (now === editing) return;
+    editing = now;
+    try { window.webkit.messageHandlers.halo.postMessage(now ? 'edit' : 'noedit'); }
+    catch (e) {}
+  };
+  /* focusout fires before the next element has the focus, so read it after. */
+  document.addEventListener('focusin', report, true);
+  document.addEventListener('focusout', function () { setTimeout(report, 0); }, true);
+  window.addEventListener('load', report);
 })();
 """
 
@@ -2563,7 +2652,7 @@ HOLD_SCROLL_JS = r"""
 
 # What colour is the page actually painting itself? Google's dark theme has moved
 # shade more than once, and a hardcoded guess that drifts out of step shows up as
-# a band down the scroll gutter and a seam under the toolbar. Ask the page and
+# a band at the edge of the page and a seam under the toolbar. Ask the page and
 # follow it instead. documentElement usually has no background of its own — the
 # colour lives on body — so fall back to body.
 # What is selected in the page right now, for middle-click-to-search. Plain
@@ -3046,6 +3135,129 @@ SPELL_JS = r"""
 })();
 """
 
+# How wide the page is laid out against how wide the panel shows it, for
+# _on_page_width(). Sent on each of the first frames while the page is still
+# arriving — so a page too wide is fitted about when it is first painted
+# rather than after it has finished loading — then once the document is
+# parsed, when it has loaded and once more after, and after the panel or the
+# zoom changes its width; only when the figures have changed. Also whether the
+# page hides its own sideways overflow: one that does cannot be scrolled
+# sideways anyway, and what sticks out is usually a menu parked off screen on
+# purpose, not page the reader is missing.
+#
+# Two reports are marked settled, 0.8s and 3s after load: a fitted page is
+# checked again on those, see FIT_PROBE_JS (a page loaded in a panel not yet
+# on screen has its timers held back until it is). Each only when the page is
+# idle and the reader has not scrolled, typed or clicked for half a second —
+# or not at all, if they keep at it.
+WIDTH_JS = r"""
+(function () {
+  if (window.__haloWidth) { return; }
+  window.__haloWidth = true;
+  function hides(el) {
+    if (!el) { return false; }
+    var o = getComputedStyle(el).overflowX;
+    return o === 'hidden' || o === 'clip';
+  }
+  // A stylesheet still on its way: the layout read now is the unstyled one,
+  // where a picture is its full natural size, and fitting to that zoomed out
+  // pages that need nothing of the kind. Nothing is painted before then. Once
+  // the page has loaded every sheet is in, or has failed and never will be.
+  function styling() {
+    if (document.readyState === 'complete') { return false; }
+    var links = document.querySelectorAll('link[rel~="stylesheet"]');
+    for (var i = 0; i < links.length; i++) {
+      if (!links[i].sheet && !links[i].disabled) { return true; }
+    }
+    return false;
+  }
+  var said = '';
+  function tell(settled) {
+    var root = document.scrollingElement || document.documentElement;
+    if (!root || !document.body || styling()) { return; }
+    var hidden = hides(document.documentElement) || hides(document.body);
+    var msg = 'width ' + root.scrollWidth + ' ' + root.clientWidth + ' '
+      + (hidden ? 1 : 0);
+    if (msg === said && !settled) { return; }
+    said = msg;
+    try {
+      window.webkit.messageHandlers.halo.postMessage(msg + (settled ? ' 1' : ' 0'));
+    } catch (e) {}
+  }
+  var timer = 0;
+  function soon(ms) {
+    clearTimeout(timer);
+    timer = setTimeout(function () { tell(false); }, ms);
+  }
+  var busy = 0;
+  ['scroll', 'wheel', 'keydown', 'pointerdown', 'touchstart'].forEach(function (t) {
+    window.addEventListener(t, function () { busy = Date.now(); },
+                            { capture: true, passive: true });
+  });
+  function settle(tries) {
+    var idle = window.requestIdleCallback || function (f) { setTimeout(f, 0); };
+    idle(function () {
+      if (Date.now() - busy >= 500) {
+        tell(true);
+      } else if (tries < 5) {
+        setTimeout(function () { settle(tries + 1); }, 1000);
+      }
+    }, { timeout: 2000 });
+  }
+  var frames = 0;
+  (function early() {
+    tell(false);
+    if (++frames < 20 && document.readyState === 'loading') {
+      requestAnimationFrame(early);
+    }
+  })();
+  document.addEventListener('DOMContentLoaded', function () { tell(false); });
+  window.addEventListener('load', function () {
+    tell(false);
+    setTimeout(function () { settle(0); }, 800);
+    setTimeout(function () { settle(0); }, 3000);
+  });
+  window.addEventListener('resize', function () { soon(250); });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { soon(250); }
+  });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) { tell(false); } });
+})();
+"""
+
+# How wide a fitted page's content would be laid out at the width it has at the
+# remembered zoom (%d CSS px), for _check_fit(). The root's width is set to
+# that, read, and put back before anything is painted: ~2ms on amazon.de.
+# Through the root's own style rather than an adopted sheet, which costs ~100ms
+# there, every element's style worked out again. Put back through the same
+# CSSOM calls — setAttribute would be refused under a strict content policy —
+# and a style attribute that was not there before is taken away again. 0 when
+# it cannot tell.
+FIT_PROBE_JS = r"""
+(function (w) {
+  var body = document.body, html = document.documentElement;
+  if (!body || !html || !html.style) { return 0; }
+  var had = html.hasAttribute('style');
+  var value = html.style.getPropertyValue('width');
+  var priority = html.style.getPropertyPriority('width');
+  try {
+    html.style.setProperty('width', w + 'px', 'important');
+    var r = body.getBoundingClientRect();
+    return Math.ceil(r.left + window.scrollX + body.scrollWidth
+      + (parseFloat(getComputedStyle(body).marginRight) || 0));
+  } catch (e) {
+    return 0;
+  } finally {
+    if (value) {
+      html.style.setProperty('width', value, priority);
+    } else {
+      html.style.removeProperty('width');
+    }
+    if (!had && !html.getAttribute('style')) { html.removeAttribute('style'); }
+  }
+})(%d);
+"""
+
 PAGE_BG_JS = r"""
 (function () {
   function bg(el) {
@@ -3161,34 +3373,6 @@ CLICK_LENS_UPLOAD_JS = r"""
 # long to give the upload before assuming the click was too early.
 LENS_SETTLE_MS = 1500
 LENS_RETRY_MS = 4500
-
-# Refine a visual search with words, the way Lens' own "Add to your search" box
-# does. Driving the real input keeps us on Google's supported path; if the box
-# has not rendered, the caller falls back to putting q= in the URL.
-ADD_TEXT_TO_LENS_JS = r"""
-(function () {
-  var text = %(text)s;
-  var box = document.querySelector('textarea[aria-label], input[aria-label]');
-  var fields = [].slice.call(document.querySelectorAll('textarea, input[type=text], input[type=search]'));
-  for (var i = 0; i < fields.length; i++) {
-    var f = fields[i];
-    if (f.offsetParent === null) continue;
-    var hint = ((f.getAttribute('aria-label') || '') + ' ' +
-                (f.placeholder || '')).toLowerCase();
-    if (hint.indexOf('add') !== -1 || hint.indexOf('search') !== -1 ||
-        hint.indexOf('suche') !== -1 || hint.indexOf('hinzu') !== -1) { box = f; break; }
-  }
-  if (!box) return 'no-box';
-  box.focus();
-  box.value = text;
-  box.dispatchEvent(new Event('input', {bubbles: true}));
-  var form = box.form;
-  if (form) { form.submit(); return 'submitted'; }
-  box.dispatchEvent(new KeyboardEvent('keydown',
-      {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-  return 'entered';
-})();
-"""
 
 # Lens answers on www.google.com these days, not lens.google.com.
 LENS_RESULT_MARKERS = ("vsrid=", "udm=26", "tbs=sbi", "lens.google.com/search")
@@ -3434,11 +3618,16 @@ def one_line(text: str) -> str:
     return HARD_BREAKS.sub(" ", text)
 
 
-def search_url(query: str, verbatim: bool = False) -> str:
+def search_url(query: str, verbatim: bool = False, ai_mode: bool = False) -> str:
     # A query is one line by definition, so this is also where a pasted
     # paragraph stops being able to reach the address at all.
     query = one_line(query).strip()
     params = {"q": query}
+    if ai_mode:
+        # Google's AI Mode is a surface of the same results page: udm=50 is
+        # the parameter its own "AI Mode" tab carries, and it answers WebKit's
+        # own user agent like any other (checked live, 2026-10).
+        params["udm"] = "50"
     if CFG["safe_search"]:
         params["safe"] = "active"
     if verbatim:
@@ -3488,9 +3677,9 @@ def _is_lens_result(uri: str) -> bool:
     hole rather than an untidiness. Every one of LENS_RESULT_MARKERS is a bare
     substring of the whole address — "vsrid=", "udm=26", "tbs=sbi" — and any
     site may carry any of them in its own query string, or merely quote a
-    Google link inside one. Whatever answers True here is a page Halo will
-    type the user's words into and submit, and whose address it will rewrite,
-    so answering True for somebody else's site means doing both to them.
+    Google link inside one. Whatever answers True here is a page whose address
+    Halo will rewrite into a search for the user's words, so answering True
+    for somebody else's site means doing that to them.
     """
     return _is_google_page(uri) and any(m in uri for m in LENS_RESULT_MARKERS)
 
@@ -3563,25 +3752,52 @@ def _uri_scheme(uri: str) -> str:
         return ""
 
 
+# Query parameters image hosts use to name the format of a picture whose path
+# has no extension: pbs.twimg.com/media/X?format=jpg, Unsplash's ?fm=jpg.
+_IMAGE_FORMAT_PARAMS = ("format", "fm")
+_IMAGE_FORMATS = frozenset("jpg jpeg png webp gif avif".split())
+
+
 def _uri_names_an_image(uri: str) -> bool:
     """Does this web address name a picture?
 
-    The PATH only. A query string routinely carries an unrelated file name
-    ("?next=/photo.jpg") and just as routinely carries none at all, so
-    matching the whole address both invents pictures and misses them.
+    The PATH, mostly. A query string routinely carries an unrelated file name
+    ("?next=/photo.jpg"), so matching the whole address invents pictures; the
+    only query words trusted are the format parameters image hosts use for
+    addresses with no extension, and Google's own thumbnails, which are the
+    pictures most often dragged out of a results page.
 
-    Deliberately conservative: an address that is a picture but does not say
-    so is searched as a page instead, which shows the picture. An address that
-    is a page but ends in .png would be handed to Lens, which is the wrong way
-    round, and only an extension test keeps that from happening.
+    Deliberately conservative the other way too: a page that merely ends in
+    .png — a file on GitHub, a picture's page on Wikipedia — is a page, and
+    handing it to Lens searched an HTML document. An address that is a picture
+    but does not say so is still searched as a page, which shows the picture.
     """
     if _uri_scheme(uri) not in ("http", "https"):
         return False
     try:
-        path = urllib.parse.urlparse(uri).path
+        parts = urllib.parse.urlparse(uri)
     except Exception:
         return False
-    return path.lower().endswith(IMAGE_EXTS)
+    path = parts.path
+    host = (parts.hostname or "").lower()
+    # github.com/o/r/blob/main/x.png and …/wiki/File:X.jpg (Datei:, Fichier:,
+    # any namespace) are the pages about a picture, not the picture.
+    if "/blob/" in path or "/tree/" in path:
+        return False
+    if ":" in path.rsplit("/", 1)[-1]:
+        return False
+    if path.lower().endswith(IMAGE_EXTS):
+        return True
+    try:
+        query = urllib.parse.parse_qs(parts.query)
+    except Exception:
+        query = {}
+    for key in _IMAGE_FORMAT_PARAMS:
+        if query.get(key, [""])[0].lower() in _IMAGE_FORMATS:
+            return True
+    # encrypted-tbn0.gstatic.com/images?q=tbn:… — a results page's thumbnails.
+    return host.endswith("gstatic.com") and path == "/images" \
+        and query.get("q", [""])[0].startswith("tbn:")
 
 
 def _is_web_uri(uri: str) -> bool:
@@ -3637,7 +3853,24 @@ KNOWN_TLDS = frozenset(_CC_TLDS.split()) | frozenset(_GENERIC_TLDS.split())
 # not extensions anybody searches for — and the trade this makes is the one the
 # block above already states: a wrongly-searched address costs one extra click,
 # a wrongly-loaded search costs the result entirely.
-FILE_LIKE_TLDS = frozenset("md py sh rs cc pm so".split())
+FILE_LIKE_TLDS = frozenset("md py sh rs cc pm so tf gs mm ml".split())
+# The same list grew by the source files that collide the same way: main.tf
+# (Terraform, French Southern Territories), Code.gs (Apps Script, South
+# Georgia), AppDelegate.mm (Objective-C++, Myanmar), main.ml (OCaml, Mali).
+# Not .am and .ac, though Makefile.am and configure.ac collide too: news.am and
+# armenpress.am are among Armenia's most visited sites and .ac is in real use,
+# so there the one extra click would be paid daily by people going somewhere,
+# to spare a search for an autotools file nobody types bare.
+
+# Names a home or office network answers for itself, with no public registry
+# behind them: a FRITZ!Box is fritz.box, a Telekom Speedport is speedport.ip,
+# anything announcing itself over mDNS is name.local, and .lan, .home,
+# .internal, .test and home.arpa are what routers, NAS boxes and dev servers
+# are given. Typed into a search box they are an address and nothing else — and
+# like localhost they are reached over plain http, which is what a browser does
+# with the same input and what a router's admin page actually serves.
+LOCAL_TLDS = frozenset("box local lan ip home internal intranet test arpa "
+                       "localdomain corp".split())
 
 
 def _is_ipv4(host: str) -> bool:
@@ -3655,11 +3888,36 @@ def _is_ipv4(host: str) -> bool:
     return True
 
 
+def _ipv6_literal(t: str) -> bool:
+    """[::1], [fe80::1]:8080/path — the bracketed form, which is the only one a
+    browser accepts, and so the only one anybody types meaning an address."""
+    if not t.startswith("["):
+        return False
+    end = t.find("]")
+    if end < 0:
+        return False
+    rest = t[end + 1:]
+    if rest and not (rest[0] in "/?#" or (rest[0] == ":"
+                                           and rest[1:].split("/", 1)[0].isdigit())):
+        return False
+    try:
+        import ipaddress
+        ipaddress.IPv6Address(t[1:end].split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
+
+
 def looks_like_url(text: str) -> str | None:
     """Return a loadable URL when the user clearly typed an address."""
     t = text.strip()
-    if not t or " " in t:
+    # Any whitespace, not just a space: a paste can carry a tab or a newline,
+    # and "hello\nexample.com" came back as an address WebKit then loaded as
+    # helloexample.com.
+    if not t or any(ch.isspace() for ch in t):
         return None
+    if _ipv6_literal(t):
+        return "http://" + t
     # Case-folded: a scheme typed in capitals is still a scheme, and
     # "HTTP://example.com" fell all the way through to being searched for.
     if t.lower().startswith(("http://", "https://")):
@@ -3698,8 +3956,26 @@ def looks_like_url(text: str) -> str | None:
     if low.startswith("www."):
         return "https://" + t   # nobody types "www." meaning anything else
     labels = low.split(".")
-    if plain and len(labels) == 2 and labels[-1] in FILE_LIKE_TLDS:
+    # After a file name a small number is a line, not a port — setup.py:12,
+    # main.rs:42 got through as addresses with a port. A real port is still a
+    # port: 80, 443 and anything past the low thousands, so example.md:8080
+    # keeps loading.
+    port = head.split("@")[-1].partition(":")[2]
+    line = port.isdigit() and int(port) < 1000 and int(port) not in (80, 443)
+    if whole and "@" not in head and len(labels) == 2 \
+            and labels[-1] in FILE_LIKE_TLDS and (plain or line):
         return None             # README.md, setup.py, build.sh — see above
+    if labels[-1] in LOCAL_TLDS:
+        return "http://" + t    # fritz.box, printer.local — see LOCAL_TLDS
+    # A top-level label with capitals in it is a name, not an address:
+    # System.IO, System.Net, ASP.NET, VB.NET. Nobody capitalises a domain's TLD
+    # on purpose — except with Caps Lock on, which capitalises the whole thing,
+    # so an all-capitals host still loads unless it is the .NET family, which
+    # is written that way by everyone who means the framework.
+    last = host.split(".")[-1]
+    if any(ch.isupper() for ch in last) and (
+            not host.isupper() or (len(labels) == 2 and last == "NET")):
+        return None
     if labels[-1] in KNOWN_TLDS:
         return "https://" + t
     return None
@@ -3749,16 +4025,23 @@ _CALC_FUNCS = {
     "arcsin": math.asin, "arccos": math.acos, "arctan": math.atan,
     "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
     "ln": math.log, "log": math.log10, "lg": math.log10, "log2": math.log2,
-    "exp": math.exp, "abs": abs, "floor": math.floor, "ceil": math.ceil,
-    "round": round,
+    "log10": math.log10, "exp": math.exp, "abs": abs, "floor": math.floor,
+    "ceil": math.ceil,
+    # round(2.5) is 3 on every calculator; Python's own round() says 2.
+    "round": lambda x: math.floor(abs(x) + 0.5) * (1 if x >= 0 else -1),
 }
 _CALC_CONSTS = {"pi": math.pi, "π": math.pi, "e": math.e, "tau": math.tau, "τ": math.tau}
+# Exact integers stop here, a little over 1200 digits. Anything bigger cannot be
+# shown anyway (calculate() stops at 10^300), and multiplying numbers of tens
+# of thousands of digits is what made one 119-character sum take 97 ms — on
+# every keystroke, in the window's own thread.
+CALC_MAX_BITS = 4096
 
 _CALC_TOKEN = re.compile(r"""
     \s*(?:
       (?P<num>(?:\d+(?:[.,]\d+)?|[.,]\d+)(?:[eE][+-]?\d+)?)
-    | (?P<word>log2|[A-Za-zπτ]+|√)
-    | (?P<op>\*\*|[-+*/×÷·^%!()°−])
+    | (?P<word>log10(?![\d.,])|log2(?![\d.,])|[A-Za-zπτ]+|√)
+    | (?P<op>\*\*|[-+*/×÷·^%!()°−²³])
     )""", re.VERBOSE)
 
 # What a whole query has to look like before it is worth parsing: digits,
@@ -3767,11 +4050,21 @@ _CALC_TOKEN = re.compile(r"""
 _CALC_WORDS = set(_CALC_FUNCS) | set(_CALC_CONSTS) | {"of", "von", "mod", "deg", "x"}
 # Dates, times, phone numbers and version strings are searches, not sums.
 _NOT_A_SUM = re.compile(r"""^(
-      \d{4}-\d{1,2}-\d{1,2}              # 2026-10-04
-    | \d{1,2}[./]\d{1,2}[./]\d{2,4}      # 04.10.2026, 10/4/26
-    | [\d\s]*\d+(-\d+){2,}[\d\s]*        # 1-800-555-0100
-    | \+?\d[\d\s]{6,}                    # +49 151 1234567
+      \d{4}[-/.]\d{1,2}[-/.]\d{1,2}                    # 2026-10-04, 2026/10/04
+    | \d{1,2}[./]\d{1,2}[./]\d{2,4}                    # 04.10.2026, 10/4/26
+    | (1\d{3}|20\d{2})-(0?[1-9]|1[0-2])                # 2026-10
+    | (?=(\D*\d){7})[\d\s]*\d+(-\d+){2,}[\d\s]*        # 1-800-555-0100, not 100-20-5
+    | \+\d[\d\s()/-]{6,}                               # +49 151 1234567, +49-30-1234567
+    | \d[\d\s]{6,}                                     # 0151 1234567
     )$""", re.VERBOSE)
+# 1990-2000 is a decade and 1939-1945 a war, not -10 and -6. Only upwards:
+# 2026-1990 is someone working out an age.
+_YEAR_RANGE = re.compile(r"(1\d{3}|20\d{2})\s*[-−]\s*(1\d{3}|20\d{2})")
+
+
+def _trim(text: str) -> str:
+    """The query without what ends a question: "2+2 =", "5 km in miles?"."""
+    return re.sub(r"[\s=?]+$", "", text.strip())
 
 
 def _decimal_comma() -> bool:
@@ -3779,8 +4072,12 @@ def _decimal_comma() -> bool:
     for var in ("LC_ALL", "LC_NUMERIC", "LANG"):
         value = os.environ.get(var, "")
         if value:
-            lang = value.split(".")[0].split("_")[0].lower()
-            return lang in {"de", "fr", "es", "it", "nl", "pt", "pl", "cs", "sv",
+            lang, _, region = value.split(".")[0].split("@")[0].partition("_")
+            # Switzerland and Liechtenstein write 7.5 in every language
+            # (glibc's de_CH, fr_CH, it_CH and de_LI all say so).
+            if region.upper() in {"CH", "LI"}:
+                return False
+            return lang.lower() in {"de", "fr", "es", "it", "nl", "pt", "pl", "cs", "sv",
                             "da", "fi", "nb", "nn", "no", "ru", "tr", "uk", "hu",
                             "ro", "sk", "sl", "hr", "sr", "bg", "el", "et", "lv",
                             "lt", "id", "vi"}
@@ -3792,7 +4089,9 @@ class _CalcParser:
        term := unary (('*'|'/'|mod) unary | implicit unary)*
        unary := ('-'|'+') unary | power
        power := postfix ('^' unary)?
-       postfix := primary ('!' | '%' | '°')* ['of' unary]
+       postfix := primary ('!' | '%' | '°' | '²' | '³')* ['of' unary]
+       primary := number | constant | '(' expr ')' | function argument
+       argument := '(' expr ')' | unary (implicit power)*
     """
 
     def __init__(self, tokens: list[tuple[str, str]], comma: bool):
@@ -3848,7 +4147,7 @@ class _CalcParser:
                 self.used_op = True
                 rhs = self.unary()
                 if op in ("*", "×", "·"):
-                    value = value * rhs
+                    value = _checked(value * rhs)
                 elif op in ("/", "÷"):
                     if rhs == 0:
                         raise _CalcError("division by zero")
@@ -3861,7 +4160,7 @@ class _CalcParser:
                 # 2(3+4), 2π, 3 sqrt 16 — but never two numbers side by side,
                 # which is a phone number or a typo rather than a product.
                 self.used_op = True
-                value = value * self.unary()
+                value = _checked(value * self.unary())
             else:
                 return value
 
@@ -3871,6 +4170,10 @@ class _CalcParser:
         return bool(tok) and tok[1].lower() != "e" and (
             tok[1].lower() in _CALC_FUNCS or tok[1].lower() in _CALC_CONSTS)
 
+    def _starts_constant(self) -> bool:
+        tok = self.peek("word")
+        return bool(tok) and tok[1].lower() != "e" and tok[1].lower() in _CALC_CONSTS
+
     def _percent_is_modulo(self) -> bool:
         nxt = self.toks[self.i + 1] if self.i + 1 < len(self.toks) else None
         return bool(nxt) and (nxt[0] == "num" or nxt[1] == "(")
@@ -3878,7 +4181,9 @@ class _CalcParser:
     def unary(self):
         if self.peek("op", ("-", "−")):
             self.take()
-            return -self.unary()
+            value = self.unary()
+            # 200 + -10% is 180: the sign does not stop it being a percentage.
+            return _Pct(-value) if isinstance(value, _Pct) else -value
         if self.peek("op", "+"):
             self.take()
             return self.unary()
@@ -3904,15 +4209,21 @@ class _CalcParser:
                     raise _CalcError("factorial")
                 value = math.factorial(int(value))
             elif self.peek("op", "%") and not self._percent_is_modulo():
+                # Not an operation on its own: "10%" alone is a search (and,
+                # while typing "10% of 80", a row that would come and go).
                 self.take()
-                self.used_op = True
                 value = _Pct(value / 100)
                 if self.peek("word", ("of", "von")):
                     self.take()
+                    self.used_op = True
                     value = float(value) * self.unary()
             elif self.peek("op", "°") or self.peek("word", "deg"):
                 self.take()
                 value = math.radians(value)
+            elif self.peek("op", ("²", "³")):
+                # A German keyboard has both on AltGr, and the label shows them.
+                self.used_op = True
+                value = _pow(value, 2 if self.take()[1] == "²" else 3)
             else:
                 return value
 
@@ -3929,9 +4240,6 @@ class _CalcParser:
                 raise _CalcError("unclosed bracket")
             self.take()
             return value
-        if kind == "op" and text == "√":
-            self.used_op = True
-            return _apply(math.sqrt, self.postfix())
         if kind == "word":
             name = text.lower() if text not in ("π", "τ", "√") else text
             if name in _CALC_CONSTS:
@@ -3939,15 +4247,33 @@ class _CalcParser:
                 return _CALC_CONSTS[name]
             if name in _CALC_FUNCS:
                 self.used_op = True
-                return _apply(_CALC_FUNCS[name], self.postfix())
+                if self.peek("op", "("):
+                    # sin(30)² is (sin 30)²: the bracket is the whole argument,
+                    # and what follows it applies to the result.
+                    return _apply(_CALC_FUNCS[name], self.primary())
+                return _apply(_CALC_FUNCS[name], self._bare_argument())
         raise _CalcError(f"unexpected {text!r}")
+
+    def _bare_argument(self):
+        """sin 2π, ln e², log 10³: without a bracket the argument runs on to
+        the next written operator or the next function, the way it reads — so
+        "sqrt 16 + 9" is 13 and "sin 30° cos 30°" is a product of two."""
+        value = self.unary()
+        while self.peek("op", "(") or self._starts_constant():
+            value = _checked(value * self.power())
+        return value
 
 
 def _number(text: str, comma: bool):
-    if comma and re.fullmatch(r"\d{1,3}\.\d{3}", text):
+    if re.match(r"0\d", text):
+        # 030/1234567, 0800-1234567: nobody writes a leading zero into a sum,
+        # and every German phone number starts with one.
+        raise _CalcError("leading zero")
+    if comma and re.fullmatch(r"[1-9]\d{0,2}\.\d{3}", text):
         # On a desktop that writes 7,5, "1.000" is a thousand as often as it is
         # one — measured nowhere, but a wrong answer is worse than none, so a
-        # number that could be either gets no answer at all.
+        # number that could be either gets no answer at all. "0.125" cannot
+        # be a thousand anything, so it is a fraction.
         raise _CalcError("ambiguous")
     if "," in text:
         if not comma:
@@ -3964,9 +4290,18 @@ def _div(a, b):
     return a / b
 
 
+def _checked(value):
+    """The value, unless it is an integer too big to keep working with."""
+    if isinstance(value, int) and value.bit_length() > CALC_MAX_BITS:
+        raise _CalcError("too big")
+    return value
+
+
 def _pow(base, exp):
-    if isinstance(base, int) and isinstance(exp, int) and 0 <= exp <= 4096 \
-            and abs(base) < 10 ** 6:
+    # Exact while the result stays under CALC_MAX_BITS — bit_length() × exp
+    # bounds it from above without working it out first.
+    if isinstance(base, int) and isinstance(exp, int) and 0 <= exp \
+            and abs(base).bit_length() * exp <= CALC_MAX_BITS:
         return base ** exp
     try:
         result = math.pow(base, exp)
@@ -3983,7 +4318,7 @@ def _apply(fn, value):
 
 
 def _calc_tokens(text: str) -> list[tuple[str, str]]:
-    tokens, pos = [], 0
+    tokens, pos, times = [], 0, []
     text = text.rstrip()
     while pos < len(text):
         m = _CALC_TOKEN.match(text, pos)
@@ -3999,16 +4334,28 @@ def _calc_tokens(text: str) -> list[tuple[str, str]]:
             value = "-"
         if kind == "word" and value.lower() == "x":
             kind, value = "op", "×"          # 3x4, the way people type it
+            times.append(len(tokens))
         tokens.append((kind, value))
+    # ...but only between two numbers. "2x+1" and "3x-4" are algebra, and
+    # reading the x as a times sign answered them with 2 and -12.
+    for i in times:
+        before = tokens[i - 1] if i else None
+        after = tokens[i + 1] if i + 1 < len(tokens) else None
+        if not (before and (before[0] == "num" or before == ("op", ")"))
+                and after and (after[0] == "num" or after == ("op", "("))):
+            raise _CalcError("variable")
     return tokens
 
 
 def calculate(text: str):
     """The value of a sum, or None when the text is not one."""
-    text = text.strip().rstrip("=").strip()
+    text = _trim(text)
     # A digit or a bracket: "pi", "e" and "tau" on their own are searches.
     if not text or len(text) > 120 or not re.search(r"[\d(]", text) \
             or _NOT_A_SUM.match(text):
+        return None
+    years = _YEAR_RANGE.fullmatch(text)
+    if years and int(years[1]) < int(years[2]):
         return None
     comma = _decimal_comma()
     try:
@@ -4085,6 +4432,9 @@ _units("volume", 1.0, "l", "liter", "liters", "litre", "litres")
 _units("volume", 3.785411784, "gal", "gallon", "gallons")
 _units("volume", 0.0295735295625, "floz", "fl oz")
 _units("volume", 0.2365882365, "cup", "cups")
+_units("volume", 0.473176473, "pint", "pints")                   # US, like gal and cup
+_units("volume", 0.01478676478125, "tbsp", "tablespoon", "tablespoons")
+_units("volume", 0.00492892159375, "tsp", "teaspoon", "teaspoons")
 _units("speed", 1 / 3.6, "km/h", "kmh", "kph")
 _units("speed", 1.0, "m/s")
 _units("speed", 0.44704, "mph")
@@ -4105,9 +4455,14 @@ _units("data", 1024.0, "kib")
 _units("data", 1024.0 ** 2, "mib")
 _units("data", 1024.0 ** 3, "gib")
 _units("data", 1024.0 ** 4, "tib")
+_units("data", 0.125, "bit", "bits")
+_units("data", 125.0, "kbit", "kilobit", "kilobits")
+_units("data", 1.25e5, "mbit", "megabit", "megabits")
+_units("data", 1.25e8, "gbit", "gigabit", "gigabits")
+_units("data", 1.25e11, "tbit", "terabit", "terabits")
 _units("area", 1e-6, "mm²", "sq mm")
 _units("area", 1e-4, "cm²", "sq cm")
-_units("area", 1.0, "m²", "sqm", "sq m")
+_units("area", 1.0, "m²", "sqm", "sq m", "qm", "quadratmeter")
 _units("area", 1e6, "km²", "sq km")
 _units("area", 1e4, "ha", "hectare", "hectares", "hektar")
 _units("area", 4046.8564224, "acre", "acres")
@@ -4143,26 +4498,75 @@ _TEMPS = {"c": "c", "°c": "c", "celsius": "c", "f": "f", "°f": "f", "fahrenhei
 # How a temperature is written in the answer, whichever way it was typed.
 _TEMP_SHOWN = {"c": "°C", "f": "°F", "k": "K"}
 
-_CONVERSION = re.compile(
-    r"^(?P<amount>.+?)\s*(?P<src>°?[a-zäöüß/\"'²³ ]+?)\s+(?:in|to|into|as|=|->|→|nach|zu)\s+"
-    r"(?P<dst>°?[a-zäöüß/\"'²³ ]+?)\s*$", re.IGNORECASE)
+# Where case is the whole meaning. Mb is a megabit and MB a megabyte, which
+# lower-casing everything made the same thing — 8× wrong on exactly the
+# question people ask about their internet speed. All-lowercase "mb" stays a
+# megabyte, because that is how people type it. And Cal, with the capital, is
+# the food calorie on a label, which is a kilocalorie.
+_UNITS_CASED: dict[str, tuple[str, float]] = {
+    "Kb": ("data", 125.0), "Mb": ("data", 1.25e5), "Gb": ("data", 1.25e8),
+    "Tb": ("data", 1.25e11), "Cal": ("energy", 4184.0),
+}
+# Where the amount ends and the unit begins is found by trying the longest
+# known unit first, so no unit is looked for further back than this.
+_UNIT_LONGEST = max(map(len, [*_UNITS, *_TEMPS, *_UNITS_CASED])) + 2
+# The word between the two units; the lookahead finds every one, including
+# overlapping ones like the two in "5 in in cm".
+_CONVERT_TO = re.compile(r"(?=(\s+(?:in|to|into|as|=|->|→|nach|zu)\s+))", re.IGNORECASE)
 # m2, km^2, cm3 -> m², km², cm³, so the unit table needs one spelling of each.
 _UNIT_POWER = re.compile(r"(?<=[a-zA-Z])\^?([23])(?![\d.,])")
 
 
-def _conversion_parts(text: str):
-    """(amount text, source unit, target unit, how each is shown), or None."""
-    text = _UNIT_POWER.sub(lambda m: "²" if m[1] == "2" else "³", text.strip())
-    m = _CONVERSION.match(text)
-    if not m:
-        return None
-    src_typed, dst_typed = m["src"].strip(), m["dst"].strip()
-    src, dst = src_typed.lower(), dst_typed.lower()
+def _unit(typed: str):
+    """(kind, factor or temperature scale, how it is shown) for a unit, or None."""
+    shown = re.sub(r"\s+", " ", _UNIT_POWER.sub(
+        lambda m: "²" if m[1] == "2" else "³", typed.strip()))
+    if shown in _UNITS_CASED:
+        return (*_UNITS_CASED[shown], shown)
+    key = shown.lower()
+    if key in _TEMPS:
+        return ("temperature", _TEMPS[key], _TEMP_SHOWN[_TEMPS[key]])
+    if key in _UNITS:
+        return (*_UNITS[key], shown)
+    return None
 
-    def shown(typed, key):
-        return _TEMP_SHOWN[_TEMPS[key]] if key in _TEMPS else typed
 
-    return m["amount"].strip(), src, dst, shown(src_typed, src), shown(dst_typed, dst)
+def _conversion(text: str):
+    """(amount as typed, source unit as shown, target unit as shown, value)
+    for "5 km in miles", or None.
+
+    Every "in"/"to" is a possible split and every known unit at the end of
+    what comes before it a possible source, longest first: "2 pi km" is 2π
+    kilometres, "1 fl oz" one fluid ounce, and "5 kms" nothing rather than
+    "5 k" of milliseconds. One regex used to guess the split, and guessed
+    "pi km" as amount "p" and unit "i km".
+    """
+    text = _trim(text)
+    for sep in _CONVERT_TO.finditer(text):
+        dst = _unit(text[sep.end(1):])
+        if not dst:
+            continue
+        head = text[:sep.start(1)]
+        for i in range(max(1, len(head) - _UNIT_LONGEST), len(head)):
+            src = _unit(head[i:])
+            if not src or src[0] != dst[0]:
+                continue
+            try:
+                amount = _CalcParser(_calc_tokens(head[:i]), _decimal_comma()).parse()
+                if src[0] == "temperature":
+                    kelvin = _to_kelvin(float(amount), src[1])
+                    if kelvin < 0:
+                        return None
+                    value = _from_kelvin(kelvin, dst[1])
+                else:
+                    value = float(amount) * src[1] / dst[1]
+            except (_CalcError, ArithmeticError, RecursionError, ValueError, TypeError):
+                # Not an amount — "5 k" in "5 kms" — or one too big for a float.
+                continue
+            if not math.isfinite(value):
+                return None
+            return head[:i].strip(), src[2], dst[2], value
+    return None
 
 
 def _to_kelvin(value: float, unit: str) -> float:
@@ -4175,26 +4579,8 @@ def _from_kelvin(value: float, unit: str) -> float:
 
 def convert(text: str):
     """(value, target unit as shown) for "5 km in miles", or None."""
-    parts = _conversion_parts(text)
-    if not parts:
-        return None
-    amount_text, src, dst, _src_shown, dst_shown = parts
-    try:
-        tokens = _calc_tokens(amount_text)
-        amount = _CalcParser(tokens, _decimal_comma()).parse()
-    except (_CalcError, RecursionError, OverflowError, ZeroDivisionError):
-        return None
-    if isinstance(amount, complex):
-        return None
-    if src in _TEMPS and dst in _TEMPS:
-        kelvin = _to_kelvin(float(amount), _TEMPS[src])
-        if kelvin < 0:
-            return None
-        return _from_kelvin(kelvin, _TEMPS[dst]), dst_shown
-    a, b = _UNITS.get(src), _UNITS.get(dst)
-    if not a or not b or a[0] != b[0]:
-        return None
-    return float(amount) * a[1] / b[1], dst_shown
+    found = _conversion(text)
+    return (found[3], found[2]) if found else None
 
 
 def _typed_comma(text: str) -> bool:
@@ -4211,7 +4597,18 @@ def quick_answer(text: str) -> str | None:
 
     The value alone — "84", "3,10686 miles" — so Tab can put it in the field
     and copying it gives something that pastes cleanly.
+
+    It never raises. It runs on every keystroke, inside the field's signal
+    handler, and anything escaping from it stopped the suggestions from
+    updating — so a sum that cannot be worked out is simply not a sum.
     """
+    try:
+        return _quick_answer(text)
+    except Exception:
+        return None
+
+
+def _quick_answer(text: str) -> str | None:
     if not text or len(text) > 120:
         return None
     converted = convert(text)
@@ -4244,14 +4641,20 @@ def _pretty_tokens(tokens: list[tuple[str, str]]) -> str:
         low = value.lower()
         nxt = tokens[i + 1] if i + 1 < n else None
         unary = (prev is None
-                 or (prev[0] == "op" and prev[1] not in (")", "!", "%", "°"))
-                 or (prev[0] == "word" and prev[1].lower() in ("of", "von", "mod")))
+                 or (prev[0] == "op" and prev[1] not in (")", "!", "%", "°", "²", "³"))
+                 or (prev[0] == "word" and (prev[1].lower() in ("of", "von", "mod")
+                                            or prev[1].lower() in _CALC_FUNCS)))
         if kind == "op" and value in ("^", "**"):
-            # A power with a plain integer exponent becomes a superscript.
+            # A power with a plain integer exponent becomes a superscript —
+            # unless something still binds to that exponent. 2^3^2 is 2^(3²),
+            # and setting both as superscripts read "2³² = 512".
             j, sign = i + 1, ""
             if j < n and tokens[j] == ("op", "-"):
                 sign, j = "-", j + 1
-            if j < n and tokens[j][0] == "num" and tokens[j][1].isdigit():
+            after = tokens[j + 1] if j + 1 < n else None
+            if j < n and tokens[j][0] == "num" and tokens[j][1].isdigit() and not (
+                    after and (after[1] in ("^", "**", "!", "%", "°", "²", "³")
+                               or after == ("word", "deg"))):
                 out.append((sign + tokens[j][1]).translate(_SUPERSCRIPT))
                 prev, i = tokens[j], j + 1
                 continue
@@ -4266,9 +4669,14 @@ def _pretty_tokens(tokens: list[tuple[str, str]]) -> str:
         elif kind == "op":
             out.append(value)                       # ( ) ! °
         elif kind == "word" and low in ("sqrt", "√"):
-            # √16 rather than √(16) when the root is of a single number.
+            # √16 rather than √(16) when the root is of a single number — and
+            # nothing after the bracket would join the root once it is gone:
+            # sqrt(2)π is √2·π, and "√2π" is the root of 2π.
+            after = tokens[i + 4] if i + 4 < n else None
             if (i + 3 < n and tokens[i + 1] == ("op", "(")
-                    and tokens[i + 2][0] == "num" and tokens[i + 3] == ("op", ")")):
+                    and tokens[i + 2][0] == "num" and tokens[i + 3] == ("op", ")")
+                    and (after is None or after == ("word", "mod") or after[1] in (
+                        "+", "-", "*", "/", "×", "÷", "·", ")", "^", "**", "²", "³"))):
                 out.append("√" + tokens[i + 2][1])
                 prev, i = tokens[i + 3], i + 4
                 continue
@@ -4302,11 +4710,11 @@ def _pretty_value(value: str) -> str:
 def answer_label(text: str, answer: str) -> str:
     """What the answer row reads: "12 × 7 = 84", "5 km = 3.10686 miles"."""
     try:
-        text = text.strip().rstrip("=").strip()
-        parts = _conversion_parts(text)
-        if parts and convert(text) is not None:
-            amount = _pretty_tokens(_calc_tokens(parts[0]))
-            return f"{amount} {parts[3]} = {_pretty_value(answer)}"
+        text = _trim(text)
+        found = _conversion(text)
+        if found:
+            amount = _pretty_tokens(_calc_tokens(found[0]))
+            return f"{amount} {found[1]} = {_pretty_value(answer)}"
         return f"{_pretty_tokens(_calc_tokens(text))} = {_pretty_value(answer)}"
     except Exception:
         return "= " + answer
@@ -4512,11 +4920,60 @@ class DesktopIntegration:
     # One dconf entry per shortcut: …/custom-keybindings/halo0/, halo1/, …
     KEY_PATH_BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/halo"
 
+    # What the Desktop Entry specification makes a launcher quote: an argument
+    # holding any of these goes in double quotes. Quoting only on a space, as
+    # this used to, broke a path like ~/Bob's/halo.py outright — GLib reads
+    # the lone ' as an unterminated quote and the launcher never starts.
+    _EXEC_RESERVED = frozenset(" \t\n\"'\\><~|&;$*?#()`")
+
+    @classmethod
+    def _exec_arg(cls, arg: str) -> str:
+        """One argument as an Exec= line spells it, key-file escapes and all."""
+        if not arg or any(c in cls._EXEC_RESERVED for c in arg):
+            arg = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+        # %% for a literal percent, or GIO reads "100%done" as a field code; and
+        # every backslash doubled again, because the key file unescapes the
+        # value before the Exec rules ever see it.
+        return arg.replace("%", "%%").replace("\\", "\\\\")
+
+    @classmethod
+    def _exec_command(cls, extra: str = "") -> str:
+        """The Exec= value of the launcher and the autostart entry.
+
+        Always through the interpreter. It used to be left out whenever halo.py
+        was executable at the moment the entry was written — and "drop the new
+        halo.py over the old one" is how Halo is updated, with a file that a
+        browser saved without the executable bit. The running copy retires the
+        moment its file changes, and then the launcher, the autostart entry
+        and the shortcut all named a file that could not be executed: nothing
+        started Halo again, and double-clicking it opened a text editor. Naming
+        the interpreter costs nothing and does not depend on the bit at all.
+        """
+        interp = " ".join(cls._exec_arg(a) for a in cls._interpreter())
+        return f"{interp} {cls._exec_arg(str(SELF_PATH))}{extra}"
+
     @staticmethod
-    def _exec_command(extra: str = "") -> str:
-        launcher = f'"{SELF_PATH}"' if " " in str(SELF_PATH) else str(SELF_PATH)
-        interp = "" if os.access(SELF_PATH, os.X_OK) else f"{sys.executable} "
-        return f"{interp}{launcher}{extra}".strip()
+    def _interpreter() -> list[str]:
+        """How setup names the Python that runs halo.py.
+
+        As halo.py's own first line does, `/usr/bin/env python3`, whenever that
+        finds the very interpreter running now — which it does for ./halo.py,
+        python3 halo.py, python3.14 halo.py and a venv alike. Naming
+        sys.executable itself pinned whichever of those Halo was last started
+        with, and every start rewrites the entries to match: started once as
+        python3.14, they all stopped opening Halo when a distribution upgrade
+        took python3.14 away. Only a Python that `python3` does not lead to
+        (a conda one, say) is named as it is, since it is the one that was
+        chosen.
+        """
+        found = shutil.which("python3")
+        try:
+            if (os.path.exists("/usr/bin/env") and found
+                    and os.path.samefile(found, sys.executable)):
+                return ["/usr/bin/env", "python3"]
+        except OSError:
+            pass
+        return [sys.executable]
 
     # ── what a shortcut runs ─────────────────────────────────────────────
     # A key used to run `halo.py --toggle`: a fresh Python whose only job is one
@@ -4536,15 +4993,20 @@ class DesktopIntegration:
     # repaired, and an older Halo reading this entry still recognises it.
     _GDBUS_TOGGLE = ("gdbus call --session --dest {app} --object-path {path} "
                      "--method org.freedesktop.Application.ActivateAction "
-                     "toggle '[]' '{{}}' >/dev/null 2>&1 || exec {interp}\"$0\" --toggle")
+                     "{action} '[]' '{{}}' >/dev/null 2>&1 || exec {interp}\"$0\" --{action}")
 
     @classmethod
-    def _toggle_command(cls) -> str:
-        """The command a Halo shortcut runs. See _GDBUS_TOGGLE."""
-        interp = ("" if os.access(SELF_PATH, os.X_OK)
-                  else GLib.shell_quote(sys.executable) + " ")
+    def _toggle_command(cls, action: str = "toggle") -> str:
+        """The command a Halo shortcut runs. See _GDBUS_TOGGLE.
+
+        The interpreter is named in the fallback whatever the executable bit
+        says, for the reason _exec_command() gives. `action` is "show" only for
+        a hand-made key that asked for --show and is being re-pointed.
+        """
+        interp = " ".join(GLib.shell_quote(a) for a in cls._interpreter()) + " "
         script = cls._GDBUS_TOGGLE.format(
-            app=APP_ID, path="/" + APP_ID.replace(".", "/"), interp=interp)
+            app=APP_ID, path="/" + APP_ID.replace(".", "/"), interp=interp,
+            action=action)
         return f"sh -c {GLib.shell_quote(script)} {GLib.shell_quote(str(SELF_PATH))}"
 
     @classmethod
@@ -4676,22 +5138,64 @@ class DesktopIntegration:
     # Halo could not see it: the row stayed unticked, the status line said "no
     # shortcut", and pressing the key worked anyway. So identify a binding by
     # what it *runs*, not by where it is filed.
+    @staticmethod
+    def _argv(command: str) -> list[str]:
+        try:
+            return GLib.shell_parse_argv(command)[1]
+        except Exception:
+            return command.split()
+
+    # What may follow halo.py in a command for it to be a key that *opens*
+    # Halo. Anything else — `halo.py -q weather` above all — is the user's own
+    # use of Halo, and claiming it was destroying it: it showed up as a ticked
+    # row, and the next tick of any key (or a repair) dropped the slot and
+    # rewrote it as a plain toggle under Halo's name, query and all gone. Halo's
+    # own `sh -c '…' halo.py` puts nothing after the path.
+    _OWN_ARGS = ((), ("--toggle",), ("--show",))
+
     @classmethod
-    def _command_script(cls, command: str) -> Path | None:
-        """The halo.py the command runs, whether or not it is the one running."""
+    def _command_script(cls, command: str,
+                        any_args: bool = False) -> Path | None:
+        """The halo.py the command runs, whether or not it is the one running.
+
+        Only for a command that opens Halo, unless `any_args` — which is for
+        the .desktop entries, whose Exec carries --daemon and is Halo's own.
+        """
         if not command:
             return None
-        try:
-            argv = GLib.shell_parse_argv(command)[1]
-        except Exception:
-            argv = command.split()
+        argv = cls._argv(command)
         wanted = SELF_PATH.name
-        for token in argv:
+        for index, token in enumerate(argv):
             # Matched on the file name alone, so a copy that has been moved is
             # still recognised as Halo rather than read as somebody else's key.
             if token and Path(token).name == wanted:
+                if not any_args and tuple(argv[index + 1:]) not in cls._OWN_ARGS:
+                    return None
                 return Path(token)
         return None
+
+    @staticmethod
+    def _script_kind(script: Path | None) -> str:
+        """Where a recorded halo.py stands: "current", "moved" or "other".
+
+        "moved" is a file that is not there any more — the case startup may
+        put right on its own, because the right path is not in doubt. "other"
+        is a halo.py that still exists somewhere else: another copy, and which
+        one the setup should start is the user's decision. Re-pointing it
+        silently meant that merely running a second copy (a download being
+        tried, a checkout) took the launcher, the autostart entry and every key
+        away from the first — and deleting the second copy then broke all three.
+        """
+        if script is None:
+            return "other"
+        try:
+            if script.resolve() == SELF_PATH:
+                return "current"
+            if script.is_absolute() and not script.exists():
+                return "moved"
+        except Exception:
+            pass
+        return "other"
 
     # Exactly what set_shortcuts() writes into a slot's name.
     ENTRY_NAME = f"{APP_NAME} — Google search"
@@ -4710,7 +5214,15 @@ class DesktopIntegration:
         """
         if cls._command_script(command) is not None:
             return True
-        return name == cls.ENTRY_NAME
+        if name != cls.ENTRY_NAME:
+            return False
+        # Halo's own name on a file that has since been renamed. The same rule
+        # about what follows the script, found here by being a .py file.
+        argv = cls._argv(command)
+        for index, token in enumerate(argv):
+            if token.endswith(".py"):
+                return tuple(argv[index + 1:]) in cls._OWN_ARGS
+        return True
 
     @classmethod
     def _command_is_current(cls, command: str) -> bool:
@@ -4762,8 +5274,9 @@ class DesktopIntegration:
         """Every custom keybinding that opens Halo, ours or hand-made.
 
         Each entry: path, accel, name, command, `ours` (filed under our own
-        prefix, so we may rewrite the slot freely) and `stale` (it starts a Halo
-        at some other path — what moving halo.py leaves behind).
+        prefix, so we may rewrite the slot freely), `stale` (it starts a Halo
+        at some other path — what moving halo.py leaves behind) and `kind`,
+        which says which of _script_kind()'s two kinds of stale that is.
         """
         if not cls.shortcut_supported():
             return []
@@ -4783,9 +5296,10 @@ class DesktopIntegration:
                     continue
                 if not (ours or cls._command_targets_halo(command, name)):
                     continue
+                kind = cls._script_kind(cls._command_script(command))
                 found.append({"path": path, "accel": binding, "name": name,
                               "command": command, "ours": ours,
-                              "stale": not cls._command_is_current(command)})
+                              "stale": kind != "current", "kind": kind})
         except Exception:
             pass
         return found
@@ -5044,10 +5558,11 @@ class DesktopIntegration:
         items = []
 
         exec_line = cls._desktop_exec(launcher)
+        kind = cls._exec_kind(exec_line, cls._exec_command())
         items.append({
             "key": "launcher", "what": "Application launcher",
             "where": str(launcher), "present": launcher.exists(),
-            "stale": bool(exec_line) and exec_line != cls._exec_command(),
+            "stale": kind != "current", "kind": kind,
             "detail": f"still starts {exec_line}" if exec_line else ""})
 
         try:
@@ -5060,10 +5575,11 @@ class DesktopIntegration:
             "detail": "drawn by an older version of Halo" if icon_stale else ""})
 
         exec_line = cls._desktop_exec(autostart)
+        kind = cls._exec_kind(exec_line, cls._exec_command(" --daemon"))
         items.append({
             "key": "autostart", "what": "Start-at-login entry",
             "where": str(autostart), "present": autostart.exists(),
-            "stale": bool(exec_line) and exec_line != cls._exec_command(" --daemon"),
+            "stale": kind != "current", "kind": kind,
             "detail": f"still starts {exec_line}" if exec_line else ""})
 
         bindings = cls.halo_bindings()
@@ -5072,24 +5588,58 @@ class DesktopIntegration:
             "key": "shortcuts", "what": "Keyboard shortcuts",
             "where": "dconf: " + cls.KEY_PATH_BASE + "0/, halo1/, …",
             "present": bool(bindings), "stale": bool(stale),
+            # The slots whose halo.py is gone — all that startup may re-point.
+            "moved": [b for b in stale if b["kind"] == "moved"],
             "detail": ("; ".join(sorted({b["command"] for b in stale}))
                        if stale else "")})
         return items
 
     @classmethod
-    def repair(cls, keys: list[str] | None = None) -> list[str]:
+    def _exec_kind(cls, exec_line: str | None, want: str) -> str:
+        """"current", "respell", "moved" or "other" for one Exec= line.
+
+        "respell" is this very file in an older spelling — above all the one
+        without the interpreter, which a copy saved without its executable bit
+        cannot run (see _exec_command()). Rewriting that is an upgrade, not a
+        decision, so startup does it quietly; the other two are _script_kind()'s.
+        """
+        if not exec_line or exec_line == want:
+            return "current"
+        # The value as GIO will read it: the key file's own escapes undone.
+        value = exec_line.replace("%%", "%").replace("\\\\", "\\")
+        kind = cls._script_kind(cls._command_script(value, any_args=True))
+        return "respell" if kind == "current" else kind
+
+    @classmethod
+    def repair(cls, keys: list[str] | None = None,
+               auto: bool = False) -> list[str]:
         """Rewrite whatever is present but wrong. Returns what was put right.
 
         Only ever repairs, never creates: a piece that is absent stays absent,
         because absent is what its switch being off looks like.
+
+        `auto` is the pass Halo makes on its own a second after it starts, and
+        it is narrower than the Repair button on purpose. It re-points only
+        what names a halo.py that no longer exists — a move, where the right
+        path is not in doubt — and quietly rewrites this file's own entries
+        from an older spelling. What it leaves alone is a setup pointing at
+        another copy that is still there: running a second halo.py is not a
+        request to hand it everything, and the button, which names what it will
+        change, is where that is decided. It returns only the moves, because
+        those are the ones worth a notification; the rest changed nothing the
+        user could see.
         """
         fixed = []
         for item in cls.audit():
             if not (item["present"] and item["stale"]):
                 continue
             key = item["key"]
+            kind = item.get("kind")
+            if auto and kind == "other":
+                continue
+            report = not auto or kind == "moved"
             if key == "launcher":
-                if cls.install_launcher():       # rewrites the icon as well
+                if cls.install_launcher() and report:  # rewrites the icon as well
                     fixed.append(item["what"])
             elif key == "icon":
                 # install_icon(), not install_launcher(): the icon can be stale
@@ -5097,9 +5647,15 @@ class DesktopIntegration:
                 # one must not create the other.
                 if cls.icon_file().exists():
                     cls.install_icon()
-                    fixed.append(item["what"])
+                    if not auto:
+                        fixed.append(item["what"])
             elif key == "autostart":
-                if cls.set_autostart(True):
+                if cls.set_autostart(True) and report:
+                    fixed.append(item["what"])
+            elif key == "shortcuts" and auto:
+                # In place, slot by slot, and only the ones whose file is gone:
+                # a key pointing at another copy that still exists stays put.
+                if cls._repoint(item["moved"]):
                     fixed.append(item["what"])
             elif key == "shortcuts":
                 # Re-point the keys that are live now, whichever slot they came
@@ -5110,6 +5666,25 @@ class DesktopIntegration:
                 if live and cls.set_shortcuts(live):
                     fixed.append(item["what"])
         return fixed
+
+    @classmethod
+    def _repoint(cls, bindings: list[dict]) -> int:
+        """Point these slots' commands at this file, keeping all else. How many."""
+        done = 0
+        try:
+            for binding in bindings:
+                # A hand-made --show, or one this already re-pointed as such.
+                shows = ("--show" in cls._argv(binding["command"])
+                         or "ActivateAction show " in binding["command"])
+                entry = Gio.Settings.new_with_path(cls.KEY_CHILD, binding["path"])
+                entry.set_string("command", cls._toggle_command(
+                    "show" if shows else "toggle"))
+                done += 1
+            if done:
+                Gio.Settings.sync()
+        except Exception:
+            pass
+        return done
 
     # ── inventory & removal, so nothing is a mystery ─────────────────────
     @classmethod
@@ -5855,6 +6430,9 @@ class _InitMixin:
         # is not. True by default so ↑ can still leave a page that never reports —
         # being unable to get back to the field is the worse failure.
         self._page_at_top = True
+        # The caret is in something on the page that uses keys itself — a text
+        # field, a player — as SCROLL_JS reports it. See _page_owns_keys().
+        self._page_editing = False
         # Find-in-page borrows the pill's own field rather than opening a box of
         # its own, so it has to remember what the field was holding.
         self.finding = False
@@ -5867,6 +6445,7 @@ class _InitMixin:
         # First run only: hold searches until the Google handshake is done.
         self.warm_pending = False
         self.deferred_query: str | None = None
+        self._deferred_ai = False              # ...and whether it was for AI Mode
         self.suggest_items: list[str] = []
         self.suggest_rows: list[tuple] = []      # the same, plus where each came from
         # What is actually built into suggest_list right now. Not the same thing
@@ -5898,6 +6477,10 @@ class _InitMixin:
         self._lens_click_timer = 0
         self._lens_retry_timer = 0
         self._lens_text_timer = 0
+        self._lens_clicked_at = 0              # when the last upload click went in
+        self._lens_prep = 0                    # bumped to drop a copy still being made
+        self._own_drag = None                  # a drag out of Halo, until it ends
+        self._own_drag_timer = 0
         # The WebKit half is built on first use, so a resident copy that has not
         # searched yet does not carry a browser engine around. Everything that
         # touches these has to cope with None.
@@ -5919,6 +6502,11 @@ class _InitMixin:
         # that used to work and now does nothing.
         self._parked_state: GLib.Bytes | None = None
         self._idle_timer = 0
+        # The page's web process died on its own (see _on_web_process_died):
+        # when the last automatic reload was, and whether one is owed for when
+        # the pill is next shown.
+        self._crash_reload_at = 0
+        self._reload_after_crash = False
         self._shaped_key = None       # last input region we actually sent to X
         self._extents_key = None      # last frame extents we told the WM
         self._last_size = None        # what _sync_geometry last measured
@@ -5929,8 +6517,22 @@ class _InitMixin:
         self._squeeze_seen = None     # the size the squeeze was last checked at
         self._squeeze_left = 0        # frames of that check still owed
         self._pill_y: int | None = None   # where the user wants the pill's top
+        self._drag_watch = 0              # following a drag until it comes to rest
+        self._drag_moved_at = 0
+        self._drag_last_pos = None
+        self._drag_noted = False
         self._anchor_timer = 0
         self._copy_timer = 0          # the copy button's brief "copied" state
+        self._zoom_timer = 0          # the address line's brief "Zoom 125%"
+        self._zoom_said = ""          # ...what it says, and what it said before
+        self._zoom_label_was = ""
+        self._zoom_scroll = 0.0       # Ctrl+wheel travel not yet spent on a step
+        self._fit_zoom = None         # the zoom this page was fitted at, if it was
+        self._fit_view_w = 0          # ...and how wide the view was then
+        self._fit_off = False         # this page was zoomed by hand: no fitting
+        self._fit_undone = False      # a fit was taken back on this page
+        self._site_fit: dict[str, float] = {}  # host -> the zoom it was fitted at
+        self._fit_host = ""           # the host of the page on screen, for that
         # Set while the "Add a shortcut" dialog is listening, so _on_key hands it
         # the keystrokes instead of acting on them. See _on_add_shortcut.
         self._accel_capture = None
@@ -5994,7 +6596,7 @@ class _InitMixin:
         # pointer stay the wrong size: set_cursor_theme() does not write back
         # into gtk-cursor-theme-size, so that property is no evidence at all
         # about what GDK is currently drawing with.
-        self._cursor_live: tuple[str, int] | None = None
+        self._cursor_live: tuple[str, int, int] | None = None
         # The monitors whose geometry is being followed, so that plugging one in
         # does not double up handlers on the ones already there.
         self._watched_monitors: set = set()
@@ -6917,6 +7519,11 @@ class _BuildMixin:
         ucm.add_script(WebKit.UserScript.new(
             AUDIO_HOOK_JS, WebKit.UserContentInjectedFrames.ALL_FRAMES,
             WebKit.UserScriptInjectionTime.START, None, None))
+        # START: it reports from the first frames on, so a page too wide is
+        # fitted about when it first paints. See _on_page_width().
+        ucm.add_script(WebKit.UserScript.new(
+            WIDTH_JS, WebKit.UserContentInjectedFrames.TOP_FRAME,
+            WebKit.UserScriptInjectionTime.START, None, None))
         # END, not START: it walks document.body, which does not exist yet at
         # the top of a parse. It only ever runs when Ctrl+F asks it to.
         ucm.add_script(WebKit.UserScript.new(
@@ -6968,11 +7575,18 @@ class _BuildMixin:
         self.web = WebKit.WebView(network_session=session, settings=settings,
                                   user_content_manager=ucm, vexpand=True)
         self.web.add_css_class("halo-web")
+        # One zoom for every page, as the panel is one window: kept across pages,
+        # engines and restarts. See _zoom_page().
+        self.web.set_zoom_level(float(CFG["page_zoom"]))
+        zoom_wheel = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL)
+        zoom_wheel.connect("scroll", self._on_zoom_scroll)
+        self.web.add_controller(zoom_wheel)
         self._watch_page_drops(self.web)
         # Opaque, in the page's own colour — NOT transparent. A transparent base
         # let the slab's sheen gradient show through everything the page does not
-        # paint itself, and the scroll gutter is exactly that: an 11px strip down
-        # the side of the results glowing brighter at the top. The rounded corners
+        # paint itself — before its first frame, past its edges, and a scroll
+        # gutter when someone has GNOME show scrollbars always. The rounded corners
         # are safe regardless, because .halo-body clips its children (overflow
         # HIDDEN) to the same radius.
         self._paint_page_bg(remembered_page_bg())
@@ -6986,6 +7600,7 @@ class _BuildMixin:
         self.web.connect("notify::uri", self._on_uri_changed)
         self.web.connect("decide-policy", self._on_decide_policy)
         self.web.connect("run-file-chooser", self._on_file_chooser)
+        self.web.connect("web-process-terminated", self._on_web_process_died)
         # Without this, target="_blank" links (and window.open) silently do
         # nothing: WebKit asks for a second view and gets none.
         self.web.connect("create", self._on_create_view)
@@ -7098,6 +7713,15 @@ class _EngineMixin:
         self._cancel_idle_release()
         # Remembered before anything is torn down, so ↓ still has somewhere to go.
         parked = self.web.get_uri() or ""
+        if not parked:
+            # A page whose web process died reads "" until it is reloaded, and
+            # its entry in the back/forward list is still where it was.
+            try:
+                item = self.web.get_back_forward_list().get_current_item()
+                parked = (item.get_uri() or "") if item is not None else ""
+            except Exception:
+                parked = ""
+        self._reload_after_crash = False    # the fresh engine starts clean
         self._parked_uri = parked if _is_web_uri(parked) else None
         # The whole back/forward list with it, and before terminate_web_process()
         # rather than after: a released engine has no list to ask for. 237 bytes
@@ -7244,6 +7868,51 @@ class _EngineMixin:
         except Exception:
             pass
 
+    # ── a page that takes its web process down with it ──────────────────
+    #
+    # Heavy pages can crash WebKit's web process, or run it past its memory
+    # limit. What is left is a blank panel whose address reads "" — measured by
+    # killing the process under Reddit — and before this Halo had nothing
+    # connected to notice: the panel stayed blank, the cover and the spinner
+    # stayed wherever the load had left them, and only Reload got the page back.
+    # reload() relaunches the process and brings back the entry it was on.
+    CRASH_RELOAD_GAP_S = 10     # a second crash this soon is a page that keeps doing it
+
+    def _on_web_process_died(self, web, reason) -> None:
+        if web is not self.web:
+            return
+        if reason == WebKit.WebProcessTerminationReason.TERMINATED_BY_API:
+            return              # release_engine() ending it on purpose
+        # Nothing is coming for whatever was being waited on.
+        self._nav_pending = False
+        if not self.pending_lens:
+            # A Lens hand-off keeps its cover: the retry it already has armed
+            # navigates to a fresh uploader, and that is the recovery.
+            self._hide_loading()
+            self._set_busy(False)
+        now = GLib.get_monotonic_time()
+        if (self._crash_reload_at
+                and now - self._crash_reload_at < self.CRASH_RELOAD_GAP_S * 1_000_000):
+            # Brought back once and down again at once: reloading in a loop
+            # would only repeat it. The button is there for another try.
+            self._reload_after_crash = False
+            self.url_label.set_text("This page crashed the browser engine — "
+                                    "Reload to try again")
+            return
+        if self.get_visible():
+            self._recover_crashed_page()
+        else:
+            # Nobody is looking, and a page brought back now would hold its
+            # memory for nothing. Showing the pill again is what asks for it.
+            self._reload_after_crash = True
+
+    def _recover_crashed_page(self) -> None:
+        self._reload_after_crash = False
+        if self.web is None:
+            return
+        self._crash_reload_at = GLib.get_monotonic_time()
+        self.web.reload()
+
     def _reopen_parked(self) -> None:
         """Put back the page the engine was carrying when it was released.
 
@@ -7343,8 +8012,8 @@ class _EngineMixin:
         """Paint everything behind Google's page in Google's own colour.
 
         The toolbar, the loading cover and the WebView's own base all take this,
-        so the panel is a single flat sheet. What the scroll gutter reveals is
-        then more of the same colour instead of the pill's gradient.
+        so the panel is a single flat sheet. Whatever the page leaves unpainted
+        is then more of the same colour instead of the pill's gradient.
         """
         rgba = Gdk.RGBA()
         if not rgba.parse(colour):
@@ -7440,13 +8109,19 @@ class _EngineMixin:
         # manager's drag advertises GdkFileList, text/uri-list and
         # text/plain, and no image type at all, so there is no texture for
         # this order to prefer.
-        drop.set_gtypes([Gdk.Texture, Gio.File, GObject.TYPE_STRING])
+        #
+        # GdkFileList before GFile: a file manager's drag of several files
+        # deserialises into a GFile holding only the first of them, so a
+        # selection of [notes.txt, photo.png] was refused for its first file
+        # and [a.png, b.png] searched a.png without a word about b.png.
+        drop.set_gtypes(self.DROP_GTYPES)
         drop.connect("drop", self._on_drop)
         self.add_controller(drop)
 
         self._wire_entry_drag()
         self._wire_entry_drop()
         self._wire_page_drop_finish()
+        self._watch_own_drags(self.entry)
         self._wire_mouse()
 
     # ── finishing the drops the page could not ──────────────────────────
@@ -7491,11 +8166,18 @@ class _EngineMixin:
         self.add_controller(declined)
 
     def _watch_page_drops(self, web) -> None:
-        """Hook a freshly built view up to _settle_page_drop()."""
+        """Hook a freshly built view up to _settle_page_drop().
+
+        Only that. A drop on the open page stays WebKit's, deliberately: the
+        page is most of the window, so a drag let go of over it is as often a
+        drag abandoned as one aimed, and a search started by it could not be
+        taken back. The pill and the field are where a drop means "search".
+        """
         watch = Gtk.EventControllerLegacy()
         watch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         watch.connect("event", self._on_page_drop_start)
         web.add_controller(watch)
+        self._watch_own_drags(web)
 
     @staticmethod
     def _drop_starting(controller):
@@ -7512,6 +8194,81 @@ class _EngineMixin:
             self._page_drop = drop
             GLib.idle_add(self._settle_page_drop, drop)
         return False                # WebKit still gets the drop
+
+    # ── ending the drags out of Halo that their target never confirms ────
+    #
+    # A drag Halo starts — a link or a picture out of the page, words out of
+    # the field — is an X11 drag, and GDK hides its icon only once the target
+    # answers the drop with XdndFinished. A target that takes the drop and
+    # never answers leaves the icon over the desktop until Halo exits; GDK has
+    # no deadline of its own. GNOME Text Editor is one: recorded live, a result
+    # link dropped into it reached drop-performed with the copy action chosen,
+    # then nothing — no dnd-finished, no cancel — and the icon was still mapped
+    # thirty seconds on. A native Wayland app does not show this, because there
+    # the compositor owns the icon and drops it at the release.
+    #
+    # So a drop out of Halo gets DRAG_FINISH_GRACE_MS to be answered, and then
+    # Halo ends it itself. The grace is for the target, not for show: ending a
+    # drag also releases the selection it is read from, and a target reads
+    # after the drop. A link is read in milliseconds, a photo well inside it.
+    #
+    # Each drag is caught on its first motion over the widget it started in,
+    # which is always one of these two: GTK reports a drag's own events to the
+    # widget under the pointer, and a drag starts under the pointer.
+    DRAG_FINISH_GRACE_MS = 3000
+
+    def _watch_own_drags(self, widget) -> None:
+        watch = Gtk.EventControllerLegacy()
+        watch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        watch.connect("event", self._on_own_drag_motion)
+        widget.add_controller(watch)
+
+    def _on_own_drag_motion(self, controller, _event) -> bool:
+        event = controller.get_current_event()
+        if event is None or event.get_event_type() not in (
+                Gdk.EventType.DRAG_ENTER, Gdk.EventType.DRAG_MOTION):
+            return False
+        drag = event.get_drop().get_drag()      # None for another app's drag
+        if drag is None or drag is self._own_drag:
+            return False
+        self._forget_own_drag()
+        self._own_drag = drag
+        drag.connect("drop-performed", self._on_own_drag_dropped)
+        drag.connect("dnd-finished", self._forget_own_drag)
+        drag.connect("cancel", self._forget_own_drag)
+        return False
+
+    def _on_own_drag_dropped(self, drag) -> None:
+        if drag is not self._own_drag:
+            return
+        if self._own_drag_timer:
+            GLib.source_remove(self._own_drag_timer)
+        self._own_drag_timer = GLib.timeout_add(self.DRAG_FINISH_GRACE_MS,
+                                                self._end_own_drag, drag)
+
+    def _end_own_drag(self, drag) -> bool:
+        self._own_drag_timer = 0
+        if drag is not self._own_drag:
+            return False
+        self._own_drag = None
+        # The icon first, as a drop that went in: a done-with-success hides it
+        # where it is, and once it is done nothing can slide it back.
+        drag.drop_done(True)
+        # Then the owner — WebKit for the page, GtkText for the field — so it
+        # stops waiting too. Finished, unless the target chose MOVE: a move
+        # that was never confirmed must not delete the source's own copy,
+        # least of all words dragged out of the query.
+        if drag.get_selected_action() & Gdk.DragAction.MOVE:
+            drag.cancel(Gdk.DragCancelReason.ERROR)
+        else:
+            drag.emit("dnd-finished")
+        return False
+
+    def _forget_own_drag(self, *_a) -> None:
+        self._own_drag = None
+        if self._own_drag_timer:
+            GLib.source_remove(self._own_drag_timer)
+            self._own_drag_timer = 0
 
     def _on_page_drop_declined(self, controller, _event) -> bool:
         if self._drop_starting(controller) is not None:
@@ -7549,6 +8306,10 @@ class _EngineMixin:
     # and leaving it out would have left the focus a Shift away from the same
     # dead end. KP_Tab is the keypad's, on the layouts that have one.
     _TAB_KEYS = (Gdk.KEY_Tab, Gdk.KEY_KP_Tab, Gdk.KEY_ISO_Left_Tab)
+
+    # What a drop is read as, in this order — see _wire_keys() for why the order
+    # is the whole of it. The pill, the field and the page all use the same list.
+    DROP_GTYPES = [Gdk.Texture, Gdk.FileList, Gio.File, GObject.TYPE_STRING]
 
     def _wire_mouse(self) -> None:
         click = Gtk.GestureClick()
@@ -8139,7 +8900,7 @@ class _MoveResizeMixin:
         # Pixels before paths, for the reason set out at length in _wire_keys():
         # gtk_drop_target_match() walks the TARGET's list, and a picture dragged
         # out of a web page offers its address as well as its pixels.
-        drop.set_gtypes([Gdk.Texture, Gio.File, GObject.TYPE_STRING])
+        drop.set_gtypes(self.DROP_GTYPES)
         drop.connect("drop", self._on_entry_drop)
         inner.add_controller(drop)
         self._entry_drop = drop
@@ -8197,10 +8958,20 @@ class _MoveResizeMixin:
         used to be. Measured: dragged to the top of the screen, one keystroke
         later it was 247px lower down.
 
-        On a short delay because the move belongs to the window manager and is
-        not necessarily finished the moment the gesture is.
+        Followed rather than timed, because the gesture does not end when the
+        drag does: it ends the moment the window manager takes the move over,
+        and the drag goes on for as long as the hand does. This used to note
+        the spot 120ms after that, which is wherever the pill happened to be
+        120ms into the drag — recorded live, let go of at y=93, anchored at
+        136, and the first keystroke's settle took it back down there. See
+        _watch_dropped_position().
         """
-        GLib.timeout_add(120, self._note_dropped_position)
+        self._drag_moved_at = GLib.get_monotonic_time()
+        self._drag_last_pos = None
+        self._drag_noted = False
+        if not self._drag_watch:
+            self._drag_watch = GLib.timeout_add(self.DRAG_SAMPLE_MS,
+                                                self._watch_dropped_position)
         # Dragging is the one way the pill crosses to another monitor while it is
         # open, so it is the one place the cursor size can go stale on screen.
         GLib.idle_add(self._sync_cursor_size)
@@ -8237,6 +9008,42 @@ class _MoveResizeMixin:
             self.set_focus(self.entry)
             self.entry.grab_focus()
             self.entry.set_position(-1)
+
+    # How often a drag the window manager owns is sampled, how long the pill
+    # has to stand still to count as put down, and how long after its last
+    # movement the watch goes on: a hand can stop mid-drag and carry on, and
+    # nothing here can see the button come up.
+    DRAG_SAMPLE_MS = 40
+    DRAG_STILL_MS = 200
+    DRAG_WATCH_MS = 3000
+
+    def _watch_dropped_position(self) -> bool:
+        """Adopt the pill's spot each time a drag has come to rest.
+
+        One X round trip a sample (~0.1ms), and only for a few seconds after a
+        drag. Moves that are not the user's — the window manager lifting a
+        window that has outgrown the room, _restore_pill_y() putting it back —
+        pass through here too, and _note_pill_y() already refuses the first
+        and the second only confirms the anchor.
+        """
+        xid = self._xid()
+        where = WM.get_position(xid) if xid and self.get_visible() else None
+        if where is None:
+            self._drag_watch = 0
+            return False
+        now = GLib.get_monotonic_time()
+        if where != self._drag_last_pos:
+            self._drag_last_pos = where
+            self._drag_moved_at = now
+            self._drag_noted = False
+        elif (not self._drag_noted
+              and now - self._drag_moved_at >= self.DRAG_STILL_MS * 1000):
+            self._drag_noted = True
+            self._note_dropped_position()
+        if now - self._drag_moved_at < self.DRAG_WATCH_MS * 1000:
+            return True
+        self._drag_watch = 0
+        return False
 
     def _note_dropped_position(self) -> bool:
         """Adopt the spot a drag left the pill in, and re-cap the drawers for it."""
@@ -8333,6 +9140,12 @@ class _MoveResizeMixin:
 class _KeysMixin:
     # HaloWindow: the keyboard.
     # ── keyboard ────────────────────────────────────────────────────────
+    # Ctrl plus one of these zooms the page: in, out, or back to 100%. "=" is
+    # the + key on a US layout without Shift; on a German one + is its own key.
+    _ZOOM_KEYS = {Gdk.KEY_plus: 1, Gdk.KEY_equal: 1, Gdk.KEY_KP_Add: 1,
+                  Gdk.KEY_minus: -1, Gdk.KEY_KP_Subtract: -1,
+                  Gdk.KEY_0: 0, Gdk.KEY_KP_0: 0}
+
     def _on_key(self, _c, keyval: int, _code: int, state: Gdk.ModifierType) -> bool:
         # The "Add a shortcut" dialog wants the raw keystroke, and this handler
         # sits above it in the capture phase, so it has to hand it over rather
@@ -8369,6 +9182,13 @@ class _KeysMixin:
             self.hide_popup()
             return True
 
+        # Several shortcuts below are also everyday editing keys — Ctrl+Enter
+        # sends a comment, Ctrl+Shift+V pastes as plain text, Ctrl+U underlines,
+        # Ctrl+K makes a link, Ctrl+↑/↓ moves by paragraph — so while the caret
+        # is in a text field on the page they are the page's. Ctrl+L, Esc, find,
+        # reload and zoom stay Halo's everywhere, as they stay a browser's.
+        page_owns = self._page_owns_keys()
+
         if ctrl and shift and kv in (Gdk.KEY_S, Gdk.KEY_s):
             self.on_circle_to_search()
             return True
@@ -8379,12 +9199,21 @@ class _KeysMixin:
         # Before the plain Ctrl+V branch below, which would otherwise claim this
         # too — both spellings of the key are in its tuple.
         if ctrl and shift and kv in (Gdk.KEY_V, Gdk.KEY_v):
+            if page_owns:
+                return False        # paste as plain text, into the page's field
             self._paste_and_search()
             return True
         if ctrl and kv in (Gdk.KEY_U, Gdk.KEY_u):
+            if page_owns:
+                return False        # underline, in the page's editor
             self.on_pick_image()
             return True
-        if ctrl and kv in (Gdk.KEY_L, Gdk.KEY_l, Gdk.KEY_K, Gdk.KEY_k):
+        if ctrl and kv in (Gdk.KEY_L, Gdk.KEY_l):
+            self.focus_entry(select_all=True)
+            return True
+        if ctrl and kv in (Gdk.KEY_K, Gdk.KEY_k):
+            if page_owns:
+                return False        # make a link, or the site's own command bar
             self.focus_entry(select_all=True)
             return True
         if (ctrl and kv in (Gdk.KEY_R, Gdk.KEY_r)) or kv == Gdk.KEY_F5:
@@ -8393,19 +9222,26 @@ class _KeysMixin:
             self._reload()
             return True
         if ctrl and kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if page_owns:
+                return False        # a comment box's "send"
             self.on_open_external()
             return True
         if ctrl and kv in (Gdk.KEY_V, Gdk.KEY_v) and self._typing_in_entry():
             if self._try_clipboard_image():
                 return True
             return False
+        if ctrl and not alt and kv in self._ZOOM_KEYS:
+            # Only with a page to zoom; on the bare pill the keys are left
+            # alone, as Ctrl+R and Ctrl+F leave theirs.
+            return self._zoom_page(self._ZOOM_KEYS[kv])
         if alt and kv == Gdk.KEY_Left:
             self._history(-1)
             return True
         if alt and kv == Gdk.KEY_Right:
             self._history(1)
             return True
-        if ctrl and kv in (Gdk.KEY_Up, Gdk.KEY_Down) and self.expanded:
+        if ctrl and kv in (Gdk.KEY_Up, Gdk.KEY_Down) and self.expanded \
+                and not page_owns:
             # DOWN grows, up shrinks, and the direction is the panel's rather
             # than the size's: the panel only ever grows downward, out of the
             # pill's bottom edge, so the key that means "more of it" is the one
@@ -8540,7 +9376,14 @@ class _KeysMixin:
             idx = 0
         if not (0 <= idx < len(texts)):
             return False
-        self._set_entry_text(texts[idx])
+        if refill and self.history_rows[idx].get("kind") == "image":
+            # A picture's row completes into what Enter on it would search: the
+            # picture on the field and its words beside it. Its label is only
+            # a name for the row — completing that typed "IMG_1234.jpg" into
+            # the box, and Enter then searched the file name as words.
+            self._complete_image_row(self.history_rows[idx])
+        else:
+            self._set_entry_text(texts[idx])
         if refill:
             # The field is the history's filter, so completing into it re-filters.
             self._fill_history()
@@ -8566,6 +9409,13 @@ class _KeysMixin:
         wrong that way: each rung is asked in order and says whether it took the
         key.
         """
+        # ── a text field on the page ──
+        # Its arrows are its own, whatever else is showing: a suggestion list
+        # left open over the panel took ↑ in a comment box and opened the
+        # history instead of moving to the line above.
+        if self._page_owns_keys():
+            return False
+
         # ── the history list ──
         if self.history_open:
             if not up:
@@ -8706,6 +9556,16 @@ class _KeysMixin:
         return focus is not None and (focus is self.entry
                                       or focus.is_ancestor(self.entry))
 
+    def _page_owns_keys(self) -> bool:
+        """True while the caret is in something on the page that takes keys.
+
+        A text field, a <select>, an editor, a player, an embedded frame — as
+        SCROLL_JS reports it. Halo's shortcuts that double as editing or
+        playback keys step aside there; the rest (Esc, Ctrl+L, Ctrl+F, Ctrl+R,
+        zoom) stay Halo's, as they stay a browser's.
+        """
+        return self._page_editing and self._focus_in_page()
+
     def _focus_in_page(self) -> bool:
         """True when the caret is in the results page rather than in the pill.
 
@@ -8785,6 +9645,12 @@ class _EntryMixin:
             self._fill_history()
             self._track_geometry()
             return
+        # A row picked with the arrows was picked for the words as they were.
+        # Typing on changes them, and the list is not always rebuilt in step —
+        # an empty answer is held for a moment, and identical rows are kept —
+        # so the highlight survived, and Enter searched it instead of what had
+        # just been typed.
+        self.suggest_list.unselect_all()
         if not CFG["suggestions"] or len(text) < 2:
             # One character is not enough to ask about, but it is the moment to
             # open the connection: the handshake then overlaps the gap to the
@@ -9668,6 +10534,29 @@ class _EntryMixin:
         self.close_history(animate=False)
         self.run_search()
 
+    def _complete_image_row(self, entry: dict) -> None:
+        """Clip a remembered picture to the field with its words, unsearched.
+
+        What Tab or → on an image row does, mirroring what they do on a text
+        row: everything Enter would search is put in place, and nothing runs.
+        A picture known only by its address is fetched for the chip the way a
+        by-URL search fetches one.
+        """
+        img = entry.get("img") or {}
+        path = img.get("path") or ""
+        uri = img.get("uri") or ""
+        self.detach_image()
+        self._set_entry_text(img.get("words") or "")
+        try:
+            there = bool(path) and Path(path).is_file()
+        except Exception:
+            there = False
+        if there:
+            self.attach_image(path, name=img.get("name") or None,
+                              uri=uri or None)
+        elif uri:
+            self._attach_from_uri(uri)
+
     def _run_history_image(self, entry: dict) -> None:
         """Run a remembered visual search again from its row.
 
@@ -9750,7 +10639,14 @@ class _EntryMixin:
 class _SearchMixin:
     # HaloWindow: searching, find in page, undoing a spelling correction.
     # ── searching ───────────────────────────────────────────────────────
-    def run_search(self) -> None:
+    def run_search(self, ai_mode: bool = False) -> None:
+        """Search what is in the field — in Google's AI Mode if `ai_mode`.
+
+        AI Mode is asked for explicitly, so it is a question for Google
+        whatever the words look like: "github.com" asked that way is something
+        to ask about, not an address to go to.
+        """
+        self._lens_prep += 1    # a big picture still being readied loses to this
         if self.finding:
             # The field holds a needle, not a query. Reachable if something else
             # activates the entry; Enter itself is caught in _on_key.
@@ -9779,7 +10675,11 @@ class _SearchMixin:
             if 0 <= idx < len(self.suggest_items):
                 self._set_entry_text(self.suggest_items[idx])
 
-        text = self.entry.get_text().strip()
+        # One line, whatever was pasted: GtkEntry keeps a newline from the
+        # clipboard, and the query went into the history as two lines — a
+        # two-line row in the drawer, never matched against the same words
+        # typed on one.
+        text = " ".join(self.entry.get_text().split())
         # A picture clipped to the field IS the search, so an empty field is
         # not the "nothing to do" it is without one — and it is the ordinary
         # case: drop a picture on the pill and press Enter. Above the empty
@@ -9829,17 +10729,22 @@ class _SearchMixin:
         # racing it. Two simultaneous requests from a session with no cookies at
         # all is exactly what makes Google serve a CAPTCHA, and the handshake is
         # also what earns dark mode. Costs a couple of seconds, once.
-        if self.warm_pending and not looks_like_url(text):
+        if self.warm_pending and (ai_mode or not looks_like_url(text)):
             self.deferred_query = text
+            self._deferred_ai = ai_mode
             self._set_busy(True)
             return
 
         if not self._ensure_webview():
             _notify(APP_NAME, "Could not start the web view.")
             return
-        direct = looks_like_url(text)
-        target = direct or search_url(text)
+        direct = None if ai_mode else looks_like_url(text)
+        target = direct or search_url(text, ai_mode=ai_mode)
         self.last_query = text
+        # An ordinary search is about no picture, so a chip still downloading
+        # for an earlier image search must not arrive and turn the next query
+        # into a visual one.
+        self._attach_serial += 1
         # Recorded here rather than on Enter, so a query held back by the
         # first-run handshake is remembered once — when it actually runs — and a
         # Lens refinement, which returns above, is not remembered as a search.
@@ -10025,8 +10930,14 @@ class _SearchMixin:
         if text in ("top", "away"):
             self._page_at_top = (text == "top")
             return
+        if text in ("edit", "noedit"):
+            self._page_editing = (text == "edit")
+            return
         if text.startswith("spell "):
             self._adopt_spelling(text[6:])
+            return
+        if text.startswith("width "):
+            self._on_page_width(text[6:])
             return
         if text.startswith("hushed "):
             self._paused_media()
@@ -10413,9 +11324,10 @@ class _SearchMixin:
             return
         self.warm_pending = False
         query, self.deferred_query = self.deferred_query, None
+        ai_mode, self._deferred_ai = self._deferred_ai, False
         if query:
             self.entry.set_text(query)
-            self.run_search()
+            self.run_search(ai_mode=ai_mode)
         else:
             self._set_busy(False)
 
@@ -10658,6 +11570,8 @@ class _LensMixin:
         each assignment. Unguarded, an afternoon of middle-click searches would
         rewrite the settings file a few hundred times to store the same None.
         """
+        # Whatever chip is still downloading was for the field as it was.
+        self._attach_serial += 1
         if self.attached is None:
             return
         self.attached = None
@@ -10849,8 +11763,12 @@ class _LensMixin:
             # ever removes it (attach_image's sweep only knows "attached.*"),
             # so a failed fetch used to leave one behind for good.
             try:
-                if ok and serial == self._attach_serial \
-                        and landing.is_file() and landing.stat().st_size:
+                # And only on a pill still open: one closed meanwhile has
+                # stashed its session, and a chip arriving into the hidden
+                # field outlived it — clipped to the next, unrelated query.
+                if ok and serial == self._attach_serial and self.get_visible() \
+                        and landing.is_file() and landing.stat().st_size \
+                        and self._is_image_file(landing):
                     self.attach_image(str(landing), name=name or "image",
                                       uri=uri)
                     # A download and a navigation are racing, and this one can
@@ -10873,6 +11791,19 @@ class _LensMixin:
                 pass
 
         self._download_to(uri, str(landing), done)
+
+    @staticmethod
+    def _is_image_file(path) -> bool:
+        """Do these bytes look like a picture? An address that named one can
+        answer with a page — a login wall, an error, a viewer — and that page,
+        saved as incoming-attach.png and attached, was then uploaded to Lens."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(512)
+            kind, _uncertain = Gio.content_type_guess(None, head)
+        except Exception:
+            return False
+        return bool(kind) and Gio.content_type_is_a(kind, "image/*")
 
     def _remember_image_search(self, words: str, *, name: str,
                                path: str | None, uri: str | None) -> None:
@@ -10933,24 +11864,132 @@ class _LensMixin:
             return
         self.load_lens(path, text=text)
 
-    def load_lens(self, path: str, text: str | None = None) -> None:
-        """Reverse-search a local image with Google Lens."""
+    # Lens' own limit, and the size it actually looks at: it scales what it is
+    # given to about a thousand pixels on the long side (vsdim=1024 on its
+    # results), so twice that keeps every detail it can use.
+    LENS_MAX_BYTES = 20 * 1024 * 1024
+    LENS_MAX_SIDE = 2048
+
+    def _save_for_lens(self, pixbuf, stem: str) -> str:
+        """Write pixels Lens will take: no larger than LENS_MAX_SIDE, as JPEG
+        unless there is transparency to keep."""
+        w, h = pixbuf.get_width(), pixbuf.get_height()
+        scale = min(1.0, self.LENS_MAX_SIDE / max(w, h, 1))
+        if scale < 1.0:
+            pixbuf = pixbuf.scale_simple(max(1, round(w * scale)),
+                                         max(1, round(h * scale)),
+                                         GdkPixbuf.InterpType.BILINEAR)
+        _own_dir(DATA_DIR)
+        if pixbuf.get_has_alpha():
+            out = DATA_DIR / (stem + ".png")
+            pixbuf.savev(str(out), "png", [], [])
+        else:
+            out = DATA_DIR / (stem + ".jpg")
+            pixbuf.savev(str(out), "jpeg", ["quality"], ["92"])
+        _own_file(out)
+        return str(out)
+
+    def _lens_ready_copy(self, path: str) -> str | None:
+        """A copy of an image too big for Lens that it will take, or None."""
+        try:
+            fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+            if fmt is None:
+                return None
+            if max(w, h) > self.LENS_MAX_SIDE:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    path, self.LENS_MAX_SIDE, self.LENS_MAX_SIDE, True)
+            else:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            return self._save_for_lens(pixbuf, "lens-upload")
+        except Exception:
+            return None
+
+    def _prepare_for_lens(self, path: str, text: str | None) -> None:
+        """Make the Lens-sized copy of a picture over its limit off the main loop,
+        then search it.
+
+        Decoding 20 MB of picture takes the better part of a second, and on the
+        main loop that was a window that neither drew nor answered for as long.
+        The spinner says something is happening meanwhile; a search or another
+        picture started before the copy is ready wins over it.
+        """
+        ticket = self._lens_prep
+        self._set_busy(True)
+
+        def work():
+            with self._LENS_PREP_LOCK:
+                copy = self._lens_ready_copy(path)
+            GLib.idle_add(self._lens_prepared, ticket, path, text, copy)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _lens_prepared(self, ticket: int, path: str, text: str | None,
+                       copy: str | None) -> bool:
+        if ticket != self._lens_prep:
+            return False        # superseded; whatever superseded it owns the spinner
+        if copy is None:
+            self._set_busy(False)
+            _notify(APP_NAME, "That image is too large for Lens (20 MB limit).")
+        else:
+            self.load_lens(path, text, upload=copy)
+        return False
+
+    def _texture_for_lens(self, texture, stem: str) -> str | None:
+        """Loose pixels too big for Lens, written out at a size it uses, or None
+        when they are small enough to be written as they are."""
+        w, h = texture.get_width(), texture.get_height()
+        if max(w, h) <= self.LENS_MAX_SIDE:
+            return None
+        try:
+            loader = Gdk.TextureDownloader.new(texture)
+            loader.set_format(Gdk.MemoryFormat.R8G8B8A8)
+            data, stride = loader.download_bytes()
+            pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+                data, GdkPixbuf.Colorspace.RGB, True, 8, w, h, stride)
+            return self._save_for_lens(pixbuf, stem)
+        except Exception:
+            return None
+
+    # One copy at a time: they share a file name under DATA_DIR.
+    _LENS_PREP_LOCK = threading.Lock()
+
+    def load_lens(self, path: str, text: str | None = None,
+                  upload: str | None = None) -> None:
+        """Reverse-search a local image with Google Lens.
+
+        `upload` is the Lens-sized copy of a picture over its limit, once
+        _prepare_for_lens() has made it.
+        """
+        # Whatever was still being prepared is not what is wanted any more.
+        self._lens_prep += 1
         try:
             size = Path(path).stat().st_size
         except OSError:
             _notify(APP_NAME, "Could not read that image.")
             return
-        if size > 20 * 1024 * 1024:
-            _notify(APP_NAME, "That image is too large for Lens (20 MB limit).")
+        # What is uploaded. A picture over Lens' limit used to be refused
+        # outright; a copy at the size Lens works at is searched instead, and
+        # the chip and the history still name the user's own file.
+        if size > self.LENS_MAX_BYTES and upload is None:
+            self._prepare_for_lens(path, text)
             return
 
         if not self._ensure_webview():
             _notify(APP_NAME, "Could not start the web view.")
             return
+        # A find needle is not words for a picture, and staying in find mode
+        # left Enter stepping through the page instead of refining.
+        self.leave_find()
         # The words first. Attaching rewrites the field's placeholder and a
         # caller may have passed text of its own, so what is being searched
         # with has to be read before anything can touch the field.
         words = (text if text is not None else self.entry.get_text()).strip()
+        if text is None and words and words == self.last_query:
+            # The query of the page on screen, not words for this picture:
+            # search "train times", drop a photo, and it was searched as
+            # "train times" and filed in the history under it. ↓ draws the same
+            # line between the last search and something new being typed.
+            words = ""
         # The chip beside the field, and the copy under DATA_DIR that outlives
         # the process. Re-attaching the picture already attached is harmless
         # and is the common case: it is what a refinement that had to fall back
@@ -10958,7 +11997,7 @@ class _LensMixin:
         self.attach_image(path)
         if self.attached:
             path = self.attached["path"]
-        self.pending_lens = path
+        self.pending_lens = upload or path
         self.lens_attempts = 0
         self._lens_await_load = False
         self._awaiting_lens_url_until = 0   # the upload route owns this search now
@@ -11124,14 +12163,22 @@ class _LensMixin:
         # file to somebody else's form with nothing on screen to say so. The
         # hand-off legitimately hops through several Google hosts, which is why
         # this is a host test and not a URL match.
-        if not _is_google_page(self.web.get_uri() or ""):
-            return False
-        self.web.evaluate_javascript(CLICK_LENS_UPLOAD_JS, -1, None, None,
-                                     None, None, None)
+        if _is_google_page(self.web.get_uri() or ""):
+            self.web.evaluate_javascript(CLICK_LENS_UPLOAD_JS, -1, None, None,
+                                         None, None, None)
+            self._lens_clicked_at = GLib.get_monotonic_time()
+        # Not clicking is not the end of the hand-off: the retry is what takes
+        # another run at a fresh uploader, and gives up properly after three.
+        # Returning without it left pending_lens set with nothing armed — the
+        # spinner turning for good and every later file chooser auto-answered —
+        # whenever the view was somewhere else, a crashed page reading "" among
+        # them.
         if self._lens_retry_timer:
             GLib.source_remove(self._lens_retry_timer)
         self._lens_retry_timer = GLib.timeout_add(LENS_RETRY_MS, self._lens_retry)
         return False
+
+    LENS_UPLOAD_WAIT_MS = 30000   # how long an upload in progress may take
 
     def _lens_retry(self) -> bool:
         """Nothing happened, so the click was too early: start over cleanly."""
@@ -11143,6 +12190,15 @@ class _LensMixin:
             self._set_busy(False)
             return False
         if _is_lens_result(self.web.get_uri() or ""):
+            return False
+        if (self._page_loading() and self._lens_clicked_at
+                and GLib.get_monotonic_time() - self._lens_clicked_at
+                < self.LENS_UPLOAD_WAIT_MS * 1000):
+            # The click took and the picture is still on its way up: the view
+            # is loading Lens' upload. Navigating now is what cancels it, and a
+            # big capture on a slow uplink used to be thrown away that way three
+            # times running and end in "Lens did not take the image".
+            self._lens_retry_timer = GLib.timeout_add(1000, self._lens_retry)
             return False
         self.lens_attempts += 1
         if self.lens_attempts >= 3:
@@ -11185,25 +12241,29 @@ class _LensMixin:
             self._uncover_after(self.COVER_CAP_LENS_LAND_MS)
 
     def _apply_lens_text(self, text: str) -> None:
-        """Add words to the visual search currently on screen."""
+        """Add words to the visual search currently on screen.
+
+        By rewriting the results address's q=, which is what Google's own box
+        ends up asking for, and NOT by typing into that box and submitting its
+        form. That form carries q, udm=26 and lns_surface=26 but not vsrid —
+        Google's script adds the visual search's identity on the way out, and a
+        script-driven submit (form.submit() and requestSubmit() alike) goes out
+        without it. Google answers that with "400. That's an error." Measured
+        against live Lens: every follow-up typed after Circle to Search ended
+        there, and the address route lands on the refined matches every time.
+        """
         if self.web is None:
             return
-        # Which page these words are for. Checked again before the script runs
-        # and again before the address is rewritten, because 900ms is long
-        # enough for the view to have moved.
+        # Which page these words are for, checked again when the timer fires.
         target = self.web.get_uri() or ""
-        script = ADD_TEXT_TO_LENS_JS % {"text": json.dumps(text)}
 
         def still_there() -> bool:
             """Is the view still on the page these words were typed against?
 
             By surface rather than by exact address, so Google adding a
-            parameter of its own between the Enter and the injection does not
-            silently drop the query — and so that a page which is genuinely
-            somewhere else never gets the script. ADD_TEXT_TO_LENS_JS types
-            into the first plausible search box it finds and submits the form,
-            so on somebody else's site it is Halo filling in their search for
-            them and pressing Enter.
+            parameter of its own in the meantime does not drop the query — and
+            so that a page which is genuinely somewhere else never has its
+            address rewritten into a search for the words.
             """
             if self.web is None:
                 return False
@@ -11211,37 +12271,16 @@ class _LensMixin:
             return (_is_lens_result(here)
                     and self._lens_surface(here) == self._lens_surface(target))
 
-        def applied(web, result, _data) -> None:
-            outcome = ""
-            try:
-                value = web.evaluate_javascript_finish(result)
-                outcome = value.to_string() if value else ""
-            except Exception:
-                outcome = ""
-            if outcome == "submitted":
-                # Lens' own box took the words and its form is on its way. The
-                # cover has to outlast that load rather than come off 400ms
-                # later on the page being left behind — which is exactly what
-                # "I don't know if anything changed" looked like: the
-                # un-refined results sat there, then flipped a second later.
-                # The page submitted its own form, so _nav_pending is False and
-                # nothing here is holding the cover for it; this deadline is.
-                self._uncover_after(self.COVER_CAP_LENS_LAND_MS)
-                return
+        def drive() -> bool:
+            self._lens_text_timer = 0
             if not still_there():
                 self._set_busy(False)
                 self._hide_loading()
-                return
-            # No usable input, or the keypress did nothing: ask for the
-            # refinement through the URL instead.
-            #
-            # REPLACING q=, not appending one. This used to decline the
-            # fallback outright on any URL that already carried a q= — which is
-            # precisely the URL a refinement leaves behind. So the first typed
-            # query against a picture worked and every one after it did nothing
-            # at all: the box Lens renders on its own results page is not the
-            # one this script finds, the fallback was refused, and the cover
-            # came off four hundred milliseconds later on the same page.
+                return False
+            # REPLACING q=, not appending one: the address a refinement leaves
+            # behind already carries one, and every query after the first has
+            # to replace it. Read now rather than at the call, so it is the
+            # address the page has settled on.
             uri = self.web.get_uri() or ""
             refined = self._lens_url_with_query(uri, text)
             if refined and refined != uri:
@@ -11251,7 +12290,7 @@ class _LensMixin:
                 # not the wait. Armed after _navigate(), which is what sets the
                 # flag the cover reads.
                 self._uncover_after(self.COVER_CAP_LENS_LAND_MS)
-                return
+                return False
             # Nothing was navigated to, so nothing is coming that would turn
             # the bar spinner off — FINISHED is what normally does it, and
             # there is no load to finish. This call is the only thing that
@@ -11259,31 +12298,24 @@ class _LensMixin:
             # did once _search_attached() began setting it before calling here.
             self._set_busy(False)
             self._uncover_after(400)
-
-        def drive() -> bool:
-            self._lens_text_timer = 0
-            if not still_there():
-                self._set_busy(False)
-                self._hide_loading()
-                return False
-            self.web.evaluate_javascript(script, -1, None, None, None,
-                                         applied, None)
             return False
 
-        # Give Lens a moment to build its own search box before driving it.
-        # Held by its source id so it can be cancelled: an untracked timer went
-        # on firing after the pill was closed and after the engine was handed
+        # Off the stack rather than inline: _lens_landed() calls in from
+        # notify::uri, and starting a navigation from inside the view's own
+        # signal for the one in flight is not something to lean on. Held by
+        # its source id so it can be cancelled: an untracked timer went on
+        # firing after the pill was closed and after the engine was handed
         # back, and reaching through self.web from inside it raised
         # AttributeError in a GLib callback — a traceback on stderr and a cover
         # nothing ever lifted. _cancel_lens_timers() takes it down with the
         # rest, so hide_popup() and _finish_lens() both reach it.
         if self._lens_text_timer:
             GLib.source_remove(self._lens_text_timer)
-        self._lens_text_timer = GLib.timeout_add(900, drive)
-        # Backstop, in case the evaluation never calls back at all. The Lens
-        # landing deadline rather than 2200ms, so it cannot undercut the wait
-        # that a refinement in flight legitimately needs — _uncover_after()
-        # REPLACES the armed timer rather than taking the longer of the two.
+        self._lens_text_timer = GLib.timeout_add(0, drive)
+        # Backstop, in case nothing ever lifts the cover. The Lens landing
+        # deadline, so it cannot undercut the wait a refinement in flight
+        # legitimately needs — _uncover_after() REPLACES the armed timer
+        # rather than taking the longer of the two.
         self._uncover_after(self.COVER_CAP_LENS_LAND_MS)
 
     @staticmethod
@@ -11403,10 +12435,29 @@ class _LensMixin:
             # by-URL route redirects through lens.google.com/uploadbyurl, which
             # matches no marker; clearing there would throw the expectation
             # away one hop before the results it is waiting for.
-            if (lensish and self._expecting_lens_url()
-                    and self.attached is not None):
-                self._awaiting_lens_url_until = 0
-                self._note_lens_page(uri)
+            if lensish and self._expecting_lens_url():
+                # The words that came with the picture, applied on arrival
+                # whether or not its chip has: the upload route does the same
+                # in _lens_landed(), and this one used to drop them, leaving the
+                # bare matches on screen and lens_text set — which in turn kept
+                # the field from following the page for the rest of the visit.
+                if self.lens_text:
+                    text, self.lens_text = self.lens_text, ""
+                    self._apply_lens_text(text)
+                # Adopted only once the chip is there to own them. Until then
+                # the expectation stays, and the chip's own arrival re-tracks.
+                if self.attached is not None:
+                    self._awaiting_lens_url_until = 0
+                    self._note_lens_page(uri)
+            return
+        if (not lensish and self._nav_pending and _is_lens_result(self._nav_uri)
+                and self._lens_surface(self._nav_uri)
+                == self._lens_surface(self._lens_result_uri)):
+            # Halo's own refinement of these results is on its way, and WebKit
+            # reports the outgoing address while it is: one that replaces
+            # Lens' results before they commit shows Google's uploader, /?olud=,
+            # for a moment. Taking that for the user leaving forgot the results,
+            # and the next query against the picture uploaded it all over again.
             return
         if self._lens_surface(uri) == self._lens_surface(self._lens_result_uri):
             self._lens_result_uri = uri     # same page, different query
@@ -11766,6 +12817,7 @@ class _ContextMenuMixin:
         in from a browser and a history row with no local file behind it come
         through here too, and those two can carry words with them.
         """
+        self.leave_find()
         kind = self._image_search_kind(uri)
         if kind == "data":
             path = self._data_uri_to_file(uri)
@@ -11783,6 +12835,17 @@ class _ContextMenuMixin:
         # The words, if any, are applied when the results land — the same hand-
         # off _track_lens_page() performs for an upload. Right-clicking a
         # picture carries none, which is why this used to be a bare "".
+        #
+        # The picture already on the field is not this one, so it comes off
+        # first. Left on, the results for this picture landed as *its* results
+        # — the chip on another picture's matches, and its origin recorded for
+        # the next refinement — and once this picture's own chip arrived the
+        # expectation had been spent on the wrong one, so the next query
+        # uploaded it all over again.
+        self.detach_image()
+        # Navigation first: _navigate() abandons an upload hand-off still in
+        # flight, and that clears the words and the expectation along with it.
+        self._navigate(LENS_BY_URL + urllib.parse.quote(uri, safe=""))
         self.lens_text = (text or "").strip()
         try:
             picture_name = Path(urllib.parse.urlparse(uri).path).name
@@ -11800,7 +12863,6 @@ class _ContextMenuMixin:
         self._set_busy(True)
         self._show_loading("Searching this image with Google…",
                            cap_ms=self.COVER_CAP_LENS_MS)
-        self._navigate(LENS_BY_URL + urllib.parse.quote(uri, safe=""))
 
     @staticmethod
     def _decode_data_uri(uri: str):
@@ -12301,6 +13363,11 @@ class _ContextMenuMixin:
         """
         if isinstance(value, Gdk.Texture):
             return self._lens_texture(value, "dropped.png")
+        if isinstance(value, Gdk.FileList):
+            # Lens searches one picture: the first of them that is one. A
+            # selection with a text file in front of the photo is still a drop
+            # of that photo.
+            return any(self._drop_image(one) for one in value.get_files())
         if not isinstance(value, Gio.File):
             return False
         try:
@@ -12312,6 +13379,15 @@ class _ContextMenuMixin:
                 self.load_lens(path)
                 return True
             return False
+        if uri.startswith("data:"):
+            # GTK hands a dropped data: address over as a GFile, and spells it
+            # data:///image/png;… on the way. Put it back and search the bytes.
+            if uri.startswith("data:///"):
+                uri = "data:" + uri[len("data:///"):]
+            if self._image_search_kind(uri) != "data":
+                return False
+            self._search_image(uri)
+            return True
         if uri and _uri_names_an_image(uri):
             # Google fetches the picture itself from a public address — no
             # upload, and the same route the right-click search takes.
@@ -12325,12 +13401,37 @@ class _ContextMenuMixin:
             return True
         return False
 
+    def _first_file(self, value):
+        """The GFile a drop names, or None — the first of a GdkFileList."""
+        if isinstance(value, Gdk.FileList):
+            files = value.get_files()
+            return files[0] if files else None
+        return value if isinstance(value, Gio.File) else None
+
+    def _refuse_drop(self, value) -> bool:
+        """Say why a dropped file is not searched, instead of saying nothing.
+
+        A drop that slides back with no word is indistinguishable from one
+        that did not land. Always False: the drop is still refused.
+        """
+        first = self._first_file(value)
+        name = ""
+        if first is not None:
+            try:
+                name = first.get_basename() or ""
+            except Exception:
+                name = ""
+        what = f"“{name}” is not a picture" if name else "That is not a picture"
+        _notify(APP_NAME, f"{what} — Halo can search pictures and words.")
+        return False
+
     def _on_drop(self, _target, value, _x, _y) -> bool:
         if isinstance(value, str):
             return self._search_text(value)
         if self._drop_image(value):
             return True
-        if not isinstance(value, Gio.File):
+        value = self._first_file(value)
+        if value is None:
             return False
         try:
             uri = value.get_uri() or ""
@@ -12352,8 +13453,8 @@ class _ContextMenuMixin:
         # A local file that is not a picture lands here too, as file:// — and a
         # gvfs mount (sftp:, mtp:, dav:) has bytes, but only behind a read that
         # would block the main loop for as long as the network takes. Both
-        # declined, as they always were.
-        return False
+        # declined, as they always were — but no longer in silence.
+        return self._refuse_drop(value)
 
     def _on_entry_drop(self, _target, value, _x, _y) -> bool:
         """A drop onto the search field. See _wire_entry_drop() for why.
@@ -12367,18 +13468,23 @@ class _ContextMenuMixin:
         """
         if self._drop_image(value):
             return True
-        text = value if isinstance(value, str) else ""
-        if not text and isinstance(value, Gio.File):
-            # A non-image file, or a mount with no path. Its name is the only
-            # useful thing about it here, and dropping it is at least a
-            # deliberate act — so it goes in as words rather than nowhere.
-            try:
-                text = value.get_path() or value.get_uri() or ""
-            except Exception:
-                text = ""
-        if not text:
+        if not isinstance(value, str):
+            # A file that is not a picture. It used to go in as its full path —
+            # /home/<user>/Documents/… typed into the box, and from there sent
+            # to Google's autocomplete before anyone pressed Enter.
+            first = self._first_file(value)
+            if first is not None:
+                try:
+                    uri = first.get_uri() or ""
+                except Exception:
+                    uri = ""
+                if _uri_scheme(uri) in ("http", "https"):
+                    self._insert_in_entry(uri)     # a link is words here
+                    return True
+            return self._refuse_drop(value)
+        if not value:
             return False
-        self._insert_in_entry(text)
+        self._insert_in_entry(value)
         return True
 
     def _insert_in_entry(self, text: str) -> None:
@@ -12427,6 +13533,9 @@ class _ContextMenuMixin:
         the picture goes. Caught by the suite, which found a selected phrase
         running as a visual search because the check before it had attached one.
         """
+        # A find needle is not a query: left in find mode, the words went into
+        # the find box and run_search() stepped through the page instead.
+        self.leave_find()
         self.detach_image()
         flat = " ".join((text or "").split())
         # QUERY_LIMIT is a limit on a QUERY: it is where Google stops reading.
@@ -12445,14 +13554,21 @@ class _ContextMenuMixin:
         return True
 
     def _lens_texture(self, texture: Gdk.Texture, name: str) -> bool:
-        """Put loose pixels on disk, then hand the file to Lens."""
+        """Put loose pixels on disk, then hand the file to Lens.
+
+        Scaled down first when they are bigger than Lens can use: a photo
+        dragged out of a browser arrives decoded, and 24 megapixels written out
+        as PNG came to more than Lens' 20 MB and took seconds on the main loop.
+        """
         try:
             _own_dir(DATA_DIR)
-            path = DATA_DIR / name
-            texture.save_to_png(str(path))
+            path = self._texture_for_lens(texture, Path(name).stem)
+            if path is None:
+                path = str(DATA_DIR / name)
+                texture.save_to_png(path)
         except Exception:
             return False
-        self.load_lens(str(path))
+        self.load_lens(path)
         return True
 
 class _PageMixin:
@@ -12479,6 +13595,22 @@ class _PageMixin:
             # stay up whatever else arrived — see _navigate().
             self._nav_pending = False
             self._page_at_top = True        # a new document opens at its top
+            self._page_editing = False      # ...with nothing focused in it
+            # ...and at the remembered zoom: a fit, or a step taken by hand on
+            # a fitted page, was for the page before. Unless this site was
+            # fitted already this session: then it opens at that, before it
+            # paints, instead of at full size and shrinking a moment later.
+            self._fit_zoom, self._fit_off, self._fit_undone = None, False, False
+            # Taken now: from the next load's start the address is already
+            # that one's, while this page is still the one on screen.
+            self._fit_host = self._fit_site(web.get_uri())
+            zoom = float(CFG["page_zoom"])
+            fitted = self._site_fit.get(self._fit_host)
+            if fitted is not None and fitted < zoom:
+                zoom = self._fit_zoom = fitted
+                self._fit_view_w = web.get_width()
+            if abs(web.get_zoom_level() - zoom) > 0.001:
+                web.set_zoom_level(zoom)
             self._page_selection = ""       # ...and with nothing selected in it
             # ...but not yet what is on screen. The second wait starts here and
             # the cover stays up through it — see _view_stale().
@@ -12588,11 +13720,21 @@ class _PageMixin:
 
     def _on_uri_changed(self, web, _p) -> None:
         uri = web.get_uri() or ""
+        if not uri:
+            # Not an address anybody went to: a view whose web process has died
+            # reads "" until it is reloaded, and blanking the label for it threw
+            # away the one line saying what had happened.
+            return
         pretty = uri
         try:
             parsed = urllib.parse.urlparse(uri)
-            query = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+            params = urllib.parse.parse_qs(parsed.query)
+            query = params.get("q", [""])[0]
             pretty = f"{parsed.netloc}  ·  {query}" if query else parsed.netloc + parsed.path
+            if query and params.get("udm") == ["50"] and _is_google_page(uri):
+                # Same host, same address shape as any results page, so say
+                # which surface this is: Shift+Enter lands here.
+                pretty = f"AI Mode  ·  {query}"
         except Exception:
             pass
         self.url_label.set_text(one_line(pretty))
@@ -12911,6 +14053,196 @@ class _PageMixin:
         self.btn_copy.remove_css_class("halo-copied")
         self.btn_copy.set_tooltip_text("Copy this link  ·  Ctrl+Shift+C")
         return False
+
+    # ── zoom ────────────────────────────────────────────────────────────
+    # The steps every browser uses, so a Ctrl + + here lands where it would in
+    # Firefox or Chrome.
+    ZOOM_STEPS = (0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0,
+                  2.5, 3.0)
+    ZOOM_SAID_MS = 1400
+
+    def _zoom_page(self, direction: int) -> bool:
+        """One step in (1), out (-1), or back to 100% (0). False if no page."""
+        if self.web is None or not self.expanded:
+            return False
+        current = self.web.get_zoom_level()
+        if direction == 0:
+            level = 1.0
+        elif direction > 0:
+            level = next((s for s in self.ZOOM_STEPS if s > current + 0.001),
+                         self.ZOOM_STEPS[-1])
+        else:
+            level = next((s for s in reversed(self.ZOOM_STEPS)
+                          if s < current - 0.001), self.ZOOM_STEPS[0])
+        self.web.set_zoom_level(level)
+        # Zoomed by hand: this page is not fitted again, whatever it reports.
+        fitted, self._fit_zoom, self._fit_off = self._fit_zoom, None, True
+        if direction == 0:
+            # Back to 100% means it: the site is not opened fitted any more.
+            self._site_fit.pop(self._fit_host, None)
+        # A step on a fitted page is for that page. It starts from the fitted
+        # level, so remembering it would carry one wide site's zoom onto every
+        # page after it. Ctrl + 0 is remembered as ever.
+        if (fitted is None or direction == 0) and CFG["page_zoom"] != level:
+            CFG["page_zoom"] = level
+        self._say_zoom(level)
+        return True
+
+    # ── a page wider than the panel ─────────────────────────────────────
+    #
+    # The panel is 760px, and plenty of sites are laid out for a desktop
+    # browser and no narrower — amazon.de is about 1000. Shown at the
+    # remembered zoom only the left of such a page was visible, and the rest
+    # meant scrolling sideways or zooming out by hand. So a page that reports
+    # being wider than the view is zoomed out to fit it, the way a phone's
+    # browser does, for that page only: the next page starts again from the
+    # remembered zoom (see _on_load_changed()).
+    #
+    # Never below FIT_MIN_ZOOM, where text stops being comfortable to read: a
+    # page wider still keeps a little sideways scrolling. A few pixels too wide
+    # is left alone, because what sticks out by that much is a stray element,
+    # not page.
+    #
+    # A page can be wide only for a moment while it loads — a slider laid out
+    # in full before its script folds it up — and a fitted page stays fitted
+    # whatever it reports after, since at the smaller zoom it fits either way.
+    # So once it has settled it is asked again, see _check_fit().
+    FIT_MIN_ZOOM = 0.67
+    FIT_SLACK_PX = 24
+
+    def _on_page_width(self, report: str) -> None:
+        """WIDTH_JS: '<scrollWidth> <clientWidth> <hides overflow> <settled>'."""
+        try:
+            scroll_w, client_w, hidden, settled = (int(v) for v in report.split())
+        except ValueError:
+            return
+        web = self.web
+        # Not before the view has a width of its own: a page loaded while the
+        # panel is shut lays out against WebKit's stand-in viewport, and fitting
+        # to that zoomed real pages to the floor. It reports again once the view
+        # is given its real width, which is a resize to the page.
+        if (web is None or self._fit_off or client_w <= 0
+                or web.get_width() <= 0):
+            return
+        base = float(CFG["page_zoom"])
+        if self._fit_zoom is not None and web.get_width() > self._fit_view_w + 8:
+            # The panel has been made wider since: start again from the
+            # remembered zoom. That is a new width for the page too, so it
+            # reports again, and is fitted again if it still has to be.
+            self._fit_zoom = None
+            web.set_zoom_level(base)
+            return
+        if self._fit_zoom is not None and settled and not self._fit_undone:
+            self._check_fit()
+        if hidden or scroll_w <= client_w + self.FIT_SLACK_PX:
+            return
+        current = web.get_zoom_level()
+        # Both widths are CSS pixels at the current zoom, so the ratio is how
+        # much further to go from here.
+        target = max(min(base, self.FIT_MIN_ZOOM),
+                     min(base, current * client_w / scroll_w))
+        if target >= current - 0.005:
+            return
+        web.set_zoom_level(target)
+        self._fit_zoom = target
+        self._fit_view_w = web.get_width()
+        # Pages of one site share a layout, so the next one opens at this.
+        # For the session only, and never written down.
+        if self._fit_host:
+            self._site_fit[self._fit_host] = target
+        self._say_zoom(target, fitted=True)
+
+    def _check_fit(self) -> None:
+        """Does the fitted page still need it? Laid out at the width it has at
+        the remembered zoom, see FIT_PROBE_JS, which _fit_checked() answers."""
+        web = self.web
+        width = round(web.get_width() / float(CFG["page_zoom"]))
+        fitted, uri = self._fit_zoom, web.get_uri()
+
+        def got(web, result, _data) -> None:
+            try:
+                value = web.evaluate_javascript_finish(result)
+                need = int(float(value.to_string())) if value else 0
+            except Exception:
+                return
+            # Only for the fit it was asked about: the page may have been
+            # fitted further, zoomed by hand or left in the meantime.
+            if (self._fit_zoom == fitted and not self._fit_off
+                    and web.get_uri() == uri):
+                self._fit_checked(need, width)
+
+        try:
+            web.evaluate_javascript(FIT_PROBE_JS % width, -1, None, None, None,
+                                    got, None)
+        except Exception:
+            pass
+
+    def _fit_checked(self, need: int, width: int) -> None:
+        """The fitted page's content needs `need` px where it would have
+        `width`: if that is enough after all, back to the remembered zoom."""
+        if need <= 0 or need > width + self.FIT_SLACK_PX:
+            return
+        # Once a page: should it report wide again at that zoom, it is fitted
+        # again and stays so, rather than the two going back and forth.
+        self._fit_undone = True
+        self._fit_zoom = None
+        self._site_fit.pop(self._fit_host, None)
+        self.web.set_zoom_level(float(CFG["page_zoom"]))
+        # Quietly, it is a correction; but not under a "Zoomed to fit" that
+        # is no longer true.
+        if self._zoom_timer:
+            GLib.source_remove(self._zoom_timer)
+            self._zoom_settled()
+
+    @staticmethod
+    def _fit_site(uri: str | None) -> str:
+        try:
+            return (urllib.parse.urlparse(uri or "").hostname or "").lower()
+        except ValueError:
+            return ""
+
+    def _say_zoom(self, level: float, fitted: bool = False) -> None:
+        """Show the new zoom on the address line for a moment, then the address.
+
+        Not while finding: that line is the find box's count then, and it is
+        what the user is reading.
+        """
+        if self.finding:
+            return
+        if not self._zoom_timer:
+            self._zoom_label_was = self.url_label.get_text()
+        self._zoom_said = (f"Zoomed to {round(level * 100)}% to fit" if fitted
+                           else f"Zoom {round(level * 100)}%")
+        self.url_label.set_text(self._zoom_said)
+        if self._zoom_timer:
+            GLib.source_remove(self._zoom_timer)
+        self._zoom_timer = GLib.timeout_add(self.ZOOM_SAID_MS, self._zoom_settled)
+
+    def _zoom_settled(self) -> bool:
+        self._zoom_timer = 0
+        # Only if nothing has written the line since: a page that arrived in
+        # the meantime has put its own address there, and that one is current.
+        if self.url_label.get_text() == self._zoom_said:
+            self.url_label.set_text(self._zoom_label_was)
+        return False
+
+    def _on_zoom_scroll(self, controller, _dx: float, dy: float) -> bool:
+        """Ctrl + wheel zooms, as in every browser; the page gets the rest.
+
+        A touchpad reports a stream of small deltas rather than clicks, so the
+        travel is added up and spent a whole step at a time — otherwise a two-
+        finger scroll with Ctrl held jumped the whole range in one gesture.
+        """
+        state = controller.get_current_event_state()
+        if not state & Gdk.ModifierType.CONTROL_MASK:
+            self._zoom_scroll = 0.0
+            return False
+        self._zoom_scroll += dy
+        while abs(self._zoom_scroll) >= 1.0:
+            step = 1 if self._zoom_scroll < 0 else -1      # wheel up zooms in
+            self._zoom_scroll += step
+            self._zoom_page(step)
+        return True
 
     def on_open_external(self, *_a) -> None:
         uri = self._current_uri()
@@ -13445,11 +14777,21 @@ class _GeometryMixin:
                     if mode[6].get("is-current"):
                         modes[spec[0]] = (mode[1], mode[2])
                         break
-            for _x, _y, scale, _transform, _primary, specs, _lprops in logical:
+            for _x, _y, scale, transform, _primary, specs, _lprops in logical:
                 for spec in specs:
                     size = modes.get(spec[0])
                     if size and scale > 0:
-                        outputs[spec[0]] = (float(scale), size[0], size[1])
+                        # A mode is the panel's own size, unrotated; the X
+                        # screen is rotated. The odd transforms (90 and 270,
+                        # flipped or not) are the ones that swap the two, and
+                        # leaving them as they were made a portrait screen's
+                        # device width its height: x_per_device came out at
+                        # 1080/1920, and the pointer over Halo was drawn at 14px
+                        # where 24 was right — 27 for 48 on a 4K screen at 2x.
+                        w, h = size
+                        if int(transform) % 2:
+                            w, h = h, w
+                        outputs[spec[0]] = (float(scale), w, h)
         except Exception:
             pass
         self._outputs_cache = outputs
@@ -13664,16 +15006,25 @@ class _GeometryMixin:
         display = Gdk.Display.get_default()
         settings = Gtk.Settings.get_default()
         try:
-            current = int(settings.get_property("gtk-cursor-theme-size"))
             theme = settings.get_property("gtk-cursor-theme-name") or "Adwaita"
+            monitor = self._cursor_monitor()
+            # The scale GDK multiplies by — once, at the moment it is handed
+            # the size. See below.
+            scale = max(1, monitor.get_scale_factor()) if monitor else 1
         except Exception:
             return False
         self._cursor_px = wanted
-        # What GDK is holding right now. Until this has written to it that is
-        # GtkSettings' figure, because GtkSettings is what pushed it there; from
-        # then on it is whatever was handed over last, and GtkSettings knows
-        # nothing about it. Both figures are logical: the property reads back
-        # divided by the scale, which is the unit _wanted_cursor_px() answers in.
+        # What GDK is holding right now: what was handed over last, and the
+        # scale it was handed over at. GDK turns the logical size into device
+        # pixels when it is given it and never again, so the same 24 handed
+        # over at scale 2 is 48 device pixels for good. Swapping a 4K laptop
+        # panel at 2x for an external screen at 1x — lid shut, one screen at a
+        # time — wants 24 on both, and a check on the size alone skipped the
+        # call and left the new screen on the old one's figure: measured with
+        # a real monitor swap, 48 drawn at 1x (twice too big) one way and 24 at
+        # 2x (half size) the other. GtkSettings does not re-push either, since
+        # its logical figure has not moved. Until this has handed anything over
+        # it does not know, and hands it over once.
         #
         # Comparing against the property instead is a factor-of-two bug in its
         # own right, and it was the live one. With GNOME's cursor-size at 24 and
@@ -13684,9 +15035,7 @@ class _GeometryMixin:
         # the screen that needs the most, until something else happens to move
         # the number. The same skip in reverse leaves a 1x screen on the 2x
         # figure, which is the doubling that was reported.
-        live = self._cursor_live if self._cursor_live is not None else (
-            theme, current)
-        if (theme, wanted) == live:
+        if (theme, wanted, scale) == self._cursor_live:
             # Already what GDK has. Leave it alone rather than re-asserting: on
             # an ordinary one-scale desktop this is every call, and the whole
             # point of the check is that such a desktop is never interfered with.
@@ -13697,7 +15046,7 @@ class _GeometryMixin:
                 # its X11 backend — and, like get_xid(), nothing replaces it.
                 warnings.simplefilter("ignore", DeprecationWarning)
                 display.set_cursor_theme(theme, wanted)
-            self._cursor_live = (theme, wanted)
+            self._cursor_live = (theme, wanted, scale)
         except Exception:
             pass
         return False
@@ -14210,8 +15559,12 @@ class _GeometryMixin:
             # panel_height and window_width are already logical for the same
             # reason — see _clamp_panel().
             ms = max(1, self._scale())
-            CFG["position"] = [where[0] // ms, where[1] // ms]
+            # The stamp first: CFG["position"] is the write, and with the stamp
+            # set after it the first spot ever remembered reached the file
+            # without one — read back after a restart as device pixels, which
+            # on a 2x screen opened the pill at half its coordinates.
             CFG.data["position_scale"] = ms
+            CFG["position"] = [where[0] // ms, where[1] // ms]
 
     def _saved_position(self, scale: int) -> list:
         """The remembered spot, in device pixels for the screen we have now.
@@ -14251,6 +15604,8 @@ class _ShowHideMixin:
         # else takes the mute off, so a pill dismissed once and summoned again
         # would be a panel that never made a sound for the rest of the session.
         self._wake_page()
+        if self._reload_after_crash:
+            self._recover_crashed_page()
         self._set_rim_running(True)
         first_map = not self.get_realized()
         # A hidden window has no surface, so the shape it had is gone with it and
@@ -14832,6 +16187,12 @@ class _MenuMixin:
             # Settings ▸ Keyboard on screen as a row of its own.
             self._rebuild_accel_rows()
         live = DesktopIntegration.active_shortcuts() if sync_checks else CFG["shortcuts"]
+        # What the ticks show. GNOME's keys once there have ever been any; before
+        # that, nothing bound means "not set up yet", and the ticks are the plan
+        # "Set up Halo…" will bind — the default Super+G on a fresh install. See
+        # "shortcuts_seen" in DEFAULTS.
+        ticked = (live if (live or CFG["shortcuts_seen"])
+                  else (CFG["shortcuts"] or []))
 
         for switch, state in ((self.sw_launcher, launcher),
                               (self.sw_autostart, autostart)):
@@ -14841,7 +16202,7 @@ class _MenuMixin:
                 switch.set_active(state)
                 switch.handler_unblock(switch.halo_handler)
 
-        live_ids = {DesktopIntegration._accel_id(a) for a in live}
+        live_ids = {DesktopIntegration._accel_id(a) for a in ticked}
         owners = DesktopIntegration.conflict_map()      # one sweep for all rows
         clashes = []
         for accel, check, warn in self.accel_rows:
@@ -14909,6 +16270,15 @@ class _MenuMixin:
             # adopting that answer would quietly erase the user's own list.
             return False
         live = DesktopIntegration.active_shortcuts()
+        if not live and not CFG["shortcuts_seen"]:
+            # Nothing has ever been bound, so an empty dconf says "not set up
+            # yet", not "the user removed them" — and adopting it is what
+            # unticked the default Super+G on every fresh install before
+            # anyone saw the menu, so that setup could never bind a key. Once a
+            # Halo key has been seen, an empty dconf is followed like any other.
+            return False
+        if live and not CFG["shortcuts_seen"]:
+            CFG["shortcuts_seen"] = True
         changed = False
         if ({accel_id(a) for a in live}
                 != {accel_id(a) for a in CFG["shortcuts"]}):
@@ -15128,7 +16498,18 @@ class _MenuMixin:
         broken = [i for i in items if i["present"] and i["stale"]]
         if broken:
             return "broken", items, broken
+        if CFG["setup_done"] is None:
+            # Asked once. An install that already has something on disk was
+            # set up by an older Halo; one that has nothing has not been.
+            CFG["setup_done"] = any(i["present"] for i in items)
         if not any(i["present"] for i in items):
+            return "fresh", items, []
+        # Keys alone do not end "fresh" before setup has run. A tick writes its
+        # shortcut the moment it is made, so ticking the keys first — which is
+        # what the dialog invites — used to turn the button into "Check…"
+        # before it had switched the launcher or the autostart entry on.
+        if CFG["setup_done"] is False and not any(
+                i["present"] for i in items if i["key"] != "shortcuts"):
             return "fresh", items, []
         return "ok", items, []
 
@@ -15321,6 +16702,8 @@ class _MenuMixin:
         if keys:
             CFG["shortcuts"] = keys
             ok = DesktopIntegration.set_shortcuts(keys)
+            self._note_keys_bound(keys)
+        CFG["setup_done"] = True
         # sync_checks=False, for the reason _refresh_setup_status documents: a
         # GSettings read straight after a write can still answer with the old
         # value, and here that would untick the very keys just written. The two
@@ -15428,6 +16811,7 @@ class _MenuMixin:
                 DesktopIntegration.drop_binding(binding["path"])
         CFG["shortcuts"] = [a for a in CFG["shortcuts"] if not same(a)]
         DesktopIntegration.set_shortcuts(CFG["shortcuts"])
+        self._note_keys_bound(CFG["shortcuts"])
         self._rebuild_accel_rows()
         GLib.idle_add(self._refresh_setup_status, False)
 
@@ -15553,6 +16937,7 @@ class _MenuMixin:
             CFG["custom_shortcuts"] = list(CFG["custom_shortcuts"]) + [accel]
             CFG["shortcuts"] = list(CFG["shortcuts"]) + [accel]
             DesktopIntegration.set_shortcuts(CFG["shortcuts"])
+            self._note_keys_bound(CFG["shortcuts"])
             self._rebuild_accel_rows()
             GLib.idle_add(self._refresh_setup_status, False)
 
@@ -15618,10 +17003,20 @@ class _MenuMixin:
         keys = [a for a, box, _ in self.accel_rows if box.get_active()]
         CFG["shortcuts"] = keys
         DesktopIntegration.set_shortcuts(keys)
+        self._note_keys_bound(keys)
         # sync_checks=False: trust the tick the user just made, not a read that
         # may not have caught up yet.
         GLib.idle_add(self._refresh_setup_status, False)
 
+    def _note_keys_bound(self, keys: list[str]) -> None:
+        """Halo has just put keys into dconf: from now on, follow dconf.
+
+        See "shortcuts_seen" in DEFAULTS. Set here as well as when a sync sees
+        a key, because the refresh after a tick deliberately does not read
+        dconf back, and the watcher that would is coalesced onto a timer.
+        """
+        if keys and not CFG["shortcuts_seen"]:
+            CFG["shortcuts_seen"] = True
 class _InfoMixin:
     # HaloWindow: the manual dialog.
     # ── information ─────────────────────────────────────────────────────
@@ -15664,6 +17059,8 @@ class _InfoMixin:
             ("Ctrl + F", "Find in the page — the search field becomes the "
                          "find box; Enter and Shift+Enter step through it"),
             ("Ctrl + R", "Reload"),
+            ("Ctrl + + / − / 0", "Zoom the page in, out, or back to 100% — "
+                                 "remembered for next time"),
             ("Ctrl + ↓ / ↑", "Grow / shrink the panel"),
             ("Drag below the panel", "Resize it by the bottom edge or either "
                                      "bottom corner — the border is just past "
@@ -16088,12 +17485,38 @@ class _InfoMixin:
     def _on_remove_response(self, _dialog, response: str) -> None:
         if response not in ("keep", "all"):
             return
-        removed = DesktopIntegration.remove_setup(include_data=(response == "all"))
-        if response == "all" and self.session is not None:
+        everything = response == "all"
+        if everything:
+            # The copies in memory go before the files do, and without being
+            # written. Left alone, the refresh below put config.json straight
+            # back — its key sync saw the shortcuts gone and saved that, with
+            # every other setting beside it — and the next search rewrote
+            # history.json with every search the user had just asked to lose.
+            # warmed_up comes back to False with the defaults, for the reason
+            # "Clear cookies and cache" resets it: the cookies it stood for are
+            # gone.
+            HISTORY.discard()
+            self._hist_thumbs.clear()
+            CFG.reset()
+        # Back to "never set up", so the refresh below neither writes (this is
+        # what it would otherwise decide and save) nor follows the now-empty
+        # dconf: with the keys gone that is the state a fresh install is in,
+        # and the ticks go back to being the plan "Set up Halo…" offers.
+        CFG.data["setup_done"] = False
+        CFG.data["shortcuts_seen"] = False
+        if not everything:
+            CFG.save()
+        removed = DesktopIntegration.remove_setup(include_data=everything)
+        if everything and self.session is not None:
             try:
                 self.session.get_cookie_manager().delete_all_cookies()
             except Exception:
                 pass
+        if everything:
+            self._rebuild_accel_rows()      # the user's own keys went with CFG
+            if self.history_open:
+                self._fill_history()
+                self._track_geometry()
         self._refresh_setup_status()
         _notify(f"{APP_NAME} setup removed",
                 ("Removed: " + ", ".join(removed)) if removed
@@ -16181,7 +17604,9 @@ class _InfoMixin:
         # Applied now rather than at the next start: a retention that visibly
         # does nothing until a restart reads as a setting that did not take.
         if HISTORY.prune(days):
-            HISTORY.flush()
+            # save_now(), not flush(): prune() arms no debounce, so flush() had
+            # nothing to write and the forgotten entries stayed in the file.
+            HISTORY.save_now()
             if self.history_open:
                 self._fill_history()
                 self._track_geometry()
@@ -16385,7 +17810,11 @@ class HaloApp(Adw.Application):
         and if there is nothing stale this does nothing and says nothing.
         """
         try:
-            fixed = DesktopIntegration.repair()
+            # auto: only what names a halo.py that is gone, plus this file's
+            # own entries in an older spelling. A setup pointing at another copy
+            # that still exists is left for the menu's Repair button — see
+            # DesktopIntegration.repair().
+            fixed = DesktopIntegration.repair(auto=True)
             # After repair, so a slot repair has just rewritten is already new;
             # this only catches the keys that were right but spelled the old,
             # slower way, and it says nothing because nothing was wrong.
@@ -16520,7 +17949,16 @@ class HaloApp(Adw.Application):
         if options.contains("daemon"):
             # Realize off-screen so the first real invocation is instant, but
             # never show anything at login.
-            window.set_visible(False)
+            #
+            # Only in the process that is becoming Halo. Arriving from outside,
+            # the copy it reaches is already resident, which is all --daemon
+            # asks for — and the one way that happens is the login race: the
+            # shortcut pressed before autostart got round to it starts Halo,
+            # then autostart's --daemon lands here and set_visible(False) took
+            # the pill out from under the hand typing into it, without any of
+            # hide_popup()'s bookkeeping.
+            if not command_line.get_is_remote():
+                window.set_visible(False)
             return 0
         if options.contains("toggle"):
             window.toggle()
