@@ -1,6 +1,18 @@
 # Changelog
 
+## 1.37.1
+
+- **Fixed**
+  - A pill you dragged somewhere stays there when you click into another window and then press the shortcut to go back to Halo, instead of moving to the middle of the screen
+
 ## 1.37.0
+
+<details>
+<summary><ins>Updating from 1.36.2 or older?</ins></summary>
+
+After dropping the new "halo.py" over the old one, right-click it, choose *Properties*, and tick **Allow executing file as program**. Then right-click it again and choose **Execute as Program** once. _(This is the last time you'll have to do this, future updates work without it.)_
+
+</details>
 
 - **Added**
   - Zoom the page with Ctrl + / Ctrl − / Ctrl 0 or Ctrl + mouse wheel. Halo remembers the zoom

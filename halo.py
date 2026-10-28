@@ -78,7 +78,7 @@ from pathlib import Path
 
 APP_ID = "io.github.choder7.Halo"
 APP_NAME = "Halo"
-VERSION = "1.37.0"
+VERSION = "1.37.1"
 
 AUTHOR = "Choder7"
 PROJECT_URL = "https://github.com/Choder7/Halo"
@@ -15594,6 +15594,14 @@ class _ShowHideMixin:
     # HaloWindow: showing and hiding; the shortcut pressed twice.
     # ── show / hide ─────────────────────────────────────────────────────
     def show_popup(self, reposition: bool = True) -> None:
+        # Whether the pill is up already, read before anything below changes
+        # the window: two flags, so a summon from hidden pays nothing for it.
+        # Whether an up pill then stays where it is takes two round trips to
+        # the X server, ~0.2ms, so that is asked in the idle the placement has
+        # always run in rather than in here — see _place_or_stay(). Only a
+        # reopen onto an exact spot needs the answer now, for the hold below.
+        was_up = self.get_visible() and self.get_mapped()
+        stay = was_up and not reposition and self._stays_put()
         self._cancel_idle_release()
         # Before the realise below, so the first allocation is already the right
         # size and nothing measures, shapes or places the window at a width the
@@ -15631,7 +15639,7 @@ class _ShowHideMixin:
             # Invisible until placed. See _hold_until_placed.
             self._placed_target = None
             self.set_opacity(0.0)
-        elif not reposition:
+        elif not reposition and not stay:
             # A reopen that has to land on an exact spot needs the same hold as
             # a first map, and for the same reason: this window has been
             # unmapped, so the map below is a map mutter will place, and the
@@ -15669,11 +15677,17 @@ class _ShowHideMixin:
             if xid:
                 WM.float_above(xid)
                 WM.activate(xid)
-            if reposition:
+            if stay:
+                # Raised and activated above; not placed. The one thing the
+                # placement did besides moving is checking the pointer's size
+                # for this screen, which every summon has asked since 1.37.0,
+                # so it is still asked. Cheap unless the answer has changed.
+                GLib.idle_add(self._sync_cursor_size)
+            elif reposition:
                 # Above the redraw for the same reason as the first map: a
                 # reopen that repositions would otherwise paint one frame where
                 # the pill used to be.
-                GLib.idle_add(lambda: (self.place_near_pointer(), False)[1],
+                GLib.idle_add(lambda: (self._place_or_stay(was_up), False)[1],
                               priority=GLib.PRIORITY_HIGH_IDLE)
             elif xid:
                 # Back up exactly where it was — which takes a move, because
@@ -15697,6 +15711,54 @@ class _ShowHideMixin:
         # is, and it read as simply being there already.
         GLib.idle_add(lambda: (self._update_arrow(animate=True), False)[1])
         self.focus_entry(select_all=True)
+
+    def _place_or_stay(self, was_up: bool) -> None:
+        """The summon's placement, unless the pill was up and stays put.
+
+        Staying still asks what the placement asks besides moving: the
+        pointer's size for this screen. Measured against placing every time,
+        across three runs of 28 summons each, the time to the first frame is
+        the same within the noise, and the shortcut's own call no longer pays
+        for the question at all.
+        """
+        if was_up and self._stays_put():
+            GLib.idle_add(self._sync_cursor_size)
+        else:
+            self.place_near_pointer()
+
+    def _stays_put(self) -> bool:
+        """Whether this summon is of a pill already up on the pointer's screen.
+
+        Then it is raised, activated and handed the caret like any summon, and
+        not placed. Placing it is what a pill coming back from hidden needs,
+        and run on one that never left it became a move: click into another
+        window, press the shortcut to get back, and a pill dragged out of the
+        way went back to the centre of the screen. Measured in the headless
+        shell with results open: parked at (120, 90), focus given to another
+        window, toggle() — at (580, 304) a frame later. The launcher's "show",
+        -q and ⋯ → the project page reached it the same way.
+
+        Only on the pointer's own screen, and only with the whole bar on it.
+        A pill left open on another monitor still comes over to the one being
+        worked on, as it always has: there the summon is a request to bring it
+        here, not to bring it forward. And a pill pushed partly off the edge,
+        or straddling two screens, is still fetched back into view, which is
+        what the placement always did for it.
+        """
+        if not (self.get_visible() and self.get_mapped()):
+            return False
+        xid = self._xid()
+        where = WM.get_position(xid) if xid else None
+        size = self._frame_size_device()
+        if not where or not size:
+            return False
+        scale = self._scale()
+        screen = self._monitor_rect_for(WM.pointer(), scale)
+        # The bar, which is the pill wherever the panel reaches.
+        x0, y0 = where[0], where[1]
+        x1, y1 = x0 + size[0], y0 + BAR_HEIGHT * scale
+        return (screen[0] <= x0 and x1 <= screen[0] + screen[2]
+                and screen[1] <= y0 and y1 <= screen[1] + screen[3])
 
     def _post_map(self, reposition: bool) -> bool:
         xid = self._xid()
